@@ -1,0 +1,3453 @@
+{
+  "name": "n8n-zendesk-intercom-hubspot-unified-ticket-health-sync",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "support-ticket-health/zendesk",
+        "responseMode": "onReceived",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "e4556889-3503-5943-8951-1b54e6ee0dc3",
+      "name": "Zendesk Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        100
+      ],
+      "webhookId": "00000000-0000-4000-8000-0000000000d1",
+      "notes": "Zendesk event webhooks (zen:event-type:ticket.*) or trigger webhooks (JSON template in README). 6 pinned fictional deliveries."
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "support-ticket-health/intercom",
+        "responseMode": "onReceived",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "b6af65a5-ace1-5ea3-8804-c1b73587e205",
+      "name": "Intercom Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "00000000-0000-4000-8000-0000000000d2",
+      "notes": "Intercom conversation and ticket topics. 5 pinned fictional deliveries."
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 30
+            }
+          ]
+        }
+      },
+      "id": "3674d46b-b69e-558e-ae22-2bcd5c9e5822",
+      "name": "Reconcile Poll",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        560
+      ],
+      "notes": "Every 30 min: catches updates a webhook missed. Pinned fictional poll."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Verify & Unwrap Support Event         Mode: Run Once for All Items\n// Repo: n8n-zendesk-intercom-hubspot-unified-ticket-health-sync · dhRobin Systems\n// Zendesk:  X-Zendesk-Webhook-Signature = base64(HMAC-SHA256(secret, timestamp + raw body))\n//           with X-Zendesk-Webhook-Signature-Timestamp (ISO-8601) inside the window.\n// Intercom: X-Hub-Signature = \"sha1=\" + hex(HMAC-SHA1(client_secret, raw body)).\n// Both compared in constant time; unsigned or mismatched deliveries are\n// rejected. Intercom \"ping\" and unprocessed topics are acknowledged and ignored.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst helpers = this.helpers;\nlet crypto = null;\ntry { crypto = require('crypto'); } catch (error) { crypto = null; }\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\nconst ZD_SECRET = env('ZENDESK_WEBHOOK_SECRET', '') || (SANDBOX_MODE ? 'sandbox-fictional-zendesk-signing-secret' : '');\nconst IC_SECRET = env('INTERCOM_CLIENT_SECRET', '') || (SANDBOX_MODE ? 'sandbox-fictional-intercom-client-secret' : '');\nconst TOLERANCE = Math.max(60, num('SIGNATURE_TOLERANCE_SECONDS', 600));\nconst ZD_EVENTS = csv('ZENDESK_EVENT_TYPES', 'zen:event-type:ticket.created,zen:event-type:ticket.status_changed,zen:event-type:ticket.priority_changed,zen:event-type:ticket.csat_received,zen:event-type:ticket.organization_changed');\nconst IC_TOPICS = csv('INTERCOM_TOPICS', 'conversation.user.created,conversation.admin.closed,conversation.admin.opened,conversation.admin.snoozed,conversation.admin.replied,conversation.rating.added,conversation.priority.updated,ticket.created,ticket.state.updated');\n\nlet runId; try { runId = 'sth_' + crypto.randomUUID(); } catch (e) { runId = 'sth_' + Date.now().toString(36); }\nconst run = { runId, startedAt: new Date().toISOString(), mode: SANDBOX_MODE ? 'sandbox' : DRY_RUN ? 'dry_run' : 'live', sandboxMode: SANDBOX_MODE, dryRun: DRY_RUN };\nconst items = $input.all();\nconst sharedFixtures = SANDBOX_MODE ? ((items.find((i) => i.json.sandboxFixtures) || { json: {} }).json.sandboxFixtures || null) : null;\nconst sha = (s) => crypto.createHash('sha256').update(String(s)).digest();\nconst safeEqual = (a, b) => !!crypto && typeof a === 'string' && typeof b === 'string' && a.length > 0 && b.length > 0 && crypto.timingSafeEqual(sha(a), sha(b));\n\nconst out = [];\nfor (let index = 0; index < items.length; index++) {\n  const item = items[index];\n  const h = {};\n  for (const [k, v] of Object.entries(item.json.headers || {})) h[String(k).toLowerCase()] = Array.isArray(v) ? String(v[0]) : String(v);\n  let raw = null;\n  if (item.binary && item.binary.data) { try { raw = (await helpers.getBinaryDataBuffer(index, 'data')).toString('utf8'); } catch (e) { raw = null; } }\n  let body = item.json.body;\n  if ((!body || (typeof body === 'object' && !Object.keys(body).length)) && raw) { try { body = JSON.parse(raw); } catch (e) { body = null; } }\n  if (raw === null) raw = typeof body === 'string' ? body : JSON.stringify(body ?? {});\n  if (typeof body === 'string') { try { body = JSON.parse(body); } catch (e) { body = null; } }\n  const base = { run, sandboxFixtures: sharedFixtures, origin: 'webhook', deliveryRef: `delivery-${index + 1}` };\n  const reject = (source, reason) => out.push({ json: { ...base, kind: 'rejected', source, reason } });\n  const ignore = (source, reason, topic) => out.push({ json: { ...base, kind: 'ignored', source, reason, topic: topic || null } });\n  if (!crypto) { reject(null, 'crypto_module_unavailable'); continue; }\n\n  if (h['x-zendesk-webhook-signature'] !== undefined || h['x-zendesk-webhook-id'] !== undefined) {\n    if (!ZD_SECRET) { reject('zendesk', 'webhook_secret_not_configured'); continue; }\n    const sig = h['x-zendesk-webhook-signature'] || ''; const ts = h['x-zendesk-webhook-signature-timestamp'] || '';\n    if (!sig || !ts) { reject('zendesk', 'signature_header_missing'); continue; }\n    const expected = crypto.createHmac('sha256', ZD_SECRET).update(ts + raw, 'utf8').digest('base64');\n    if (!safeEqual(sig, expected)) { reject('zendesk', 'signature_mismatch'); continue; }\n    const tsMs = Date.parse(ts);\n    if (!SANDBOX_MODE && (!Number.isFinite(tsMs) || Math.abs(Date.now() - tsMs) > TOLERANCE * 1000)) { reject('zendesk', 'timestamp_outside_tolerance'); continue; }\n    const b = body || {};\n    const type = b.type ? String(b.type) : 'trigger';\n    if (b.type && !ZD_EVENTS.includes(type)) { ignore('zendesk', 'event_type_not_processed', type); continue; }\n    out.push({ json: { ...base, kind: 'accepted', source: 'zendesk', shape: b.type ? 'zendesk_event' : 'zendesk_trigger', topic: type, deliveryId: h['x-zendesk-webhook-invocation-id'] || null, payload: b } });\n    continue;\n  }\n  if (h['x-hub-signature'] !== undefined) {\n    if (!IC_SECRET) { reject('intercom', 'webhook_secret_not_configured'); continue; }\n    const [alg, sig] = String(h['x-hub-signature']).split('=');\n    if (alg !== 'sha1' || !sig) { reject('intercom', 'signature_format_invalid'); continue; }\n    const expected = crypto.createHmac('sha1', IC_SECRET).update(raw, 'utf8').digest('hex');\n    if (!safeEqual(sig.toLowerCase(), expected)) { reject('intercom', 'signature_mismatch'); continue; }\n    const b = body || {};\n    if (b.topic === 'ping') { ignore('intercom', 'ping', 'ping'); continue; }\n    if (!IC_TOPICS.includes(String(b.topic))) { ignore('intercom', 'topic_not_processed', b.topic); continue; }\n    out.push({ json: { ...base, kind: 'accepted', source: 'intercom', shape: 'intercom_notification', topic: String(b.topic), deliveryId: b.id || null, payload: b } });\n    continue;\n  }\n  reject(null, 'no_recognised_signature');\n}\nreturn out;\n"
+      },
+      "id": "7d8cdeab-2835-5610-82ce-55eb828b30a5",
+      "name": "Verify & Unwrap Support Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        200
+      ],
+      "notes": "Zendesk base64 HMAC-SHA256(ts+body) · Intercom sha1 HMAC (client secret) · topic filters."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build Poll Window                     Mode: Run Once for All Items\n// Reconciliation poll for events a webhook may have missed. Cursors live in\n// static data: the Zendesk incremental-export cursor and the last Intercom\n// updated_at seen. First run looks back POLL_INITIAL_LOOKBACK_HOURS (24).\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nlet crypto = null; try { crypto = require('crypto'); } catch (e) { crypto = null; }\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\nconst first = $input.first().json || {};\nlet state = {};\ntry { state = $getWorkflowStaticData('global').supportPollState || {}; } catch (e) { state = {}; }\nconst lookback = Math.max(1, num('POLL_INITIAL_LOOKBACK_HOURS', 24));\nconst since = Math.floor(Date.now() / 1000) - lookback * 3600;\nlet runId; try { runId = 'sth_' + crypto.randomUUID(); } catch (e) { runId = 'sth_' + Date.now().toString(36); }\nconst zdBase = `https://${encodeURIComponent(env('ZENDESK_SUBDOMAIN', 'YOUR_ZENDESK_SUBDOMAIN'))}.zendesk.com`;\nreturn [{ json: {\n  run: { runId, startedAt: new Date().toISOString(), mode: SANDBOX_MODE ? 'sandbox' : DRY_RUN ? 'dry_run' : 'live', sandboxMode: SANDBOX_MODE, dryRun: DRY_RUN },\n  sandboxFixtures: SANDBOX_MODE ? first.sandboxFixtures || null : null,\n  poll: {\n    zendeskEnabled: flag('POLL_ZENDESK', true), intercomEnabled: flag('POLL_INTERCOM', true),\n    zendeskUrl: state.zendeskCursor ? `${zdBase}/api/v2/incremental/tickets/cursor.json?cursor=${encodeURIComponent(state.zendeskCursor)}&include=users,organizations`\n      : `${zdBase}/api/v2/incremental/tickets/cursor.json?start_time=${state.zendeskStartTime || since}&include=users,organizations`,\n    intercomBody: { query: { field: 'updated_at', operator: '>', value: state.intercomUpdatedAfter || since }, pagination: { per_page: Math.min(150, Math.max(10, num('INTERCOM_POLL_PAGE_SIZE', 100))) } },\n    intercomUpdatedAfter: state.intercomUpdatedAfter || since,\n  },\n} }];\n"
+      },
+      "id": "8d7cd8fd-1bde-5e84-9c51-138e2034f892",
+      "name": "Build Poll Window",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "baf2c28d-3b60-5686-b5aa-0df7f2e96a30",
+              "leftValue": "={{ $json.run.sandboxMode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "1609d1d0-e388-51f5-95fd-1a32b8c65d85",
+      "name": "Sandbox Poll?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Load Poll Fixtures (Sandbox)          Mode: Run Once for All Items\n// Fictional Zendesk incremental-export and Intercom search responses.\n// ─────────────────────────────────────────────────────────────────────\nconst ctx = $input.first().json;\nconst fx = (ctx.sandboxFixtures || {}).poll || {};\nreturn [{ json: { ...ctx, simulatedPoll: { zendesk: { statusCode: 200, body: fx.zendesk || { tickets: [], users: [], organizations: [], end_of_stream: true } },\n  intercom: { statusCode: 200, body: fx.intercom || { conversations: [] } } } } }];\n"
+      },
+      "id": "33ec985a-a0ce-5544-a14b-66d11fe6c6a3",
+      "name": "Load Poll Fixtures (Sandbox)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.poll.zendeskUrl }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Basic ' + (($env.ZENDESK_EMAIL || '') + '/token:' + ($env.ZENDESK_API_TOKEN || '')).base64Encode() }}"
+            }
+          ]
+        }
+      },
+      "id": "8d6f8b06-47d8-505a-93bc-996aa093b06b",
+      "name": "Poll Zendesk Tickets",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        640
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "Incremental cursor export · include=users,organizations."
+    },
+    {
+      "parameters": {
+        "url": "https://api.intercom.io/conversations/search",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.INTERCOM_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Intercom-Version",
+              "value": "={{ $env.INTERCOM_API_VERSION || '2.11' }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Build Poll Window').first().json.poll.intercomBody) }}"
+      },
+      "id": "ec9a6ae7-5da3-5e57-ac9e-622e0cd44376",
+      "name": "Poll Intercom Conversations",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        640
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "POST /conversations/search · updated_at > cursor."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Package Poll Results                  Mode: Run Once for All Items\n// Turns polled tickets/conversations into the same envelope the webhooks\n// produce (origin: poll) and, in live mode, advances the poll cursors.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst first = $input.first().json;\nconst sandbox = !!(first && first.simulatedPoll);\nconst ctx = sandbox ? first : $('Build Poll Window').first().json;\nlet zd = null; let ic = null;\nif (sandbox) { zd = first.simulatedPoll.zendesk; ic = first.simulatedPoll.intercom; }\nelse {\n  try { zd = $('Poll Zendesk Tickets').first().json; } catch (e) { zd = null; }\n  ic = first; // output of Poll Intercom Conversations\n}\nconst base = { run: ctx.run, sandboxFixtures: ctx.sandboxFixtures, origin: 'poll', kind: 'accepted' };\nconst out = []; const errors = [];\nif (ctx.poll.zendeskEnabled) {\n  if (zd && Number(zd.statusCode) === 200 && zd.body && Array.isArray(zd.body.tickets)) {\n    const users = Object.fromEntries((zd.body.users || []).map((u) => [String(u.id), u]));\n    const orgs = Object.fromEntries((zd.body.organizations || []).map((o) => [String(o.id), o]));\n    for (const t of zd.body.tickets) out.push({ json: { ...base, source: 'zendesk', shape: 'zendesk_api_ticket', topic: 'poll', deliveryRef: `poll-zendesk-${t.id}`, payload: t,\n      sideload: { requester: users[String(t.requester_id)] ? { email: users[String(t.requester_id)].email, name: users[String(t.requester_id)].name } : null,\n        organization: orgs[String(t.organization_id)] ? { name: orgs[String(t.organization_id)].name, domain: (orgs[String(t.organization_id)].domain_names || [])[0] || null } : null } } });\n  } else errors.push(`zendesk poll ${(zd && zd.statusCode) || 'network error'}`);\n}\nlet maxUpdated = ctx.poll.intercomUpdatedAfter;\nif (ctx.poll.intercomEnabled) {\n  if (ic && Number(ic.statusCode) === 200 && ic.body && Array.isArray(ic.body.conversations)) {\n    for (const c of ic.body.conversations) { out.push({ json: { ...base, source: 'intercom', shape: 'intercom_api_conversation', topic: 'poll', deliveryRef: `poll-intercom-${c.id}`, payload: c } }); maxUpdated = Math.max(maxUpdated, Number(c.updated_at) || 0); }\n  } else errors.push(`intercom poll ${(ic && ic.statusCode) || 'network error'}`);\n}\nif (!sandbox && !ctx.run.sandboxMode && !ctx.run.dryRun) {\n  try {\n    const s = $getWorkflowStaticData('global'); s.supportPollState = s.supportPollState || {};\n    if (zd && zd.body && zd.body.after_cursor) s.supportPollState.zendeskCursor = zd.body.after_cursor;\n    s.supportPollState.intercomUpdatedAfter = maxUpdated;\n  } catch (e) { /* best effort */ }\n}\nif (!out.length) out.push({ json: { ...base, kind: 'ignored', source: 'poll', reason: errors.length ? `poll_failed: ${errors.join('; ')}` : 'nothing_new', topic: 'poll' } });\nreturn out;\n"
+      },
+      "id": "c6228315-b964-5ae3-a29a-a0d134841284",
+      "name": "Package Poll Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        560
+      ],
+      "notes": "Same envelope as the webhooks · advances cursors (live only)."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "4dfccd88-9653-50be-8b1c-0495b085c4bc",
+              "leftValue": "={{ $json.kind }}",
+              "rightValue": "accepted",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "57bdda7b-9253-53cb-8999-c2b24425bd06",
+      "name": "Accepted?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Ticket Normalizer & Sentiment Evaluator  Mode: Run Once for All Items\n// Five input shapes → one unified ticket model:\n//   zendesk_trigger · zendesk_event · zendesk_api_ticket (poll)\n//   intercom_notification · intercom_api_conversation (poll)\n// Unified status: new | open | waiting_on_customer | on_hold | resolved | closed\n// Resolution: resolved/closed time − created time (calendar minutes).\n// CSAT: 1–5 (Intercom rating as-is; Zendesk good = 5, bad = 1).\n// Sentiment (−2 … +2), first available of:\n//   CSAT → provider sentiment field → keyword lexicon on the subject.\n// Several events for one ticket in a batch are merged (latest status wins,\n// any CSAT is kept). No message bodies are kept.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst ZD_SENTIMENT_FIELD = env('ZENDESK_SENTIMENT_FIELD_ID', '');\nconst IC_SENTIMENT_ATTR = env('INTERCOM_SENTIMENT_ATTRIBUTE', '');\nconst LEXICON = flag('SENTIMENT_LEXICON_ENABLED', true);\nconst SUBDOMAIN = env('ZENDESK_SUBDOMAIN', 'YOUR_ZENDESK_SUBDOMAIN');\nconst IC_APP = env('INTERCOM_APP_ID', 'YOUR_INTERCOM_APP_ID');\nconst FREE = new Set(['gmail.com', 'googlemail.com', 'outlook.com', 'hotmail.com', 'live.com', 'yahoo.com', 'icloud.com', 'me.com', 'aol.com', 'proton.me', 'protonmail.com', 'gmx.com']);\nconst LEDGER_DAYS = Math.max(1, num('EVENT_LEDGER_DAYS', 14));\nconst items = $input.all();\nconst ctx0 = items[0] ? items[0].json : {};\nconst PERSIST = ctx0.run && !ctx0.run.sandboxMode && !ctx0.run.dryRun;\n\nconst iso = (v) => { if (v === null || v === undefined || v === '') return null; const n = Number(v); const d = Number.isFinite(n) && String(v).match(/^\\d+$/) ? new Date(n < 1e12 ? n * 1000 : n) : new Date(String(v)); return Number.isNaN(d.getTime()) ? null : d.toISOString(); };\nconst email = (v) => { const s = String(v || '').trim().toLowerCase(); return /^[^@\\s]+@[^@\\s]+\\.[a-z]{2,}$/.test(s) ? s : null; };\nconst domainOf = (v) => { if (!v) return null; let s = String(v).trim().toLowerCase(); if (s.includes('@')) s = s.split('@').pop(); s = s.replace(/^[a-z]+:\\/\\//, '').replace(/^www\\./, '').split(/[/?#:]/)[0]; return /^[a-z0-9-]+(\\.[a-z0-9-]+)+$/.test(s) && !FREE.has(s) ? s : null; };\nconst ZD_STATUS = { new: 'new', open: 'open', pending: 'waiting_on_customer', hold: 'on_hold', solved: 'resolved', closed: 'closed' };\nconst IC_STATE = { open: 'open', snoozed: 'on_hold', closed: 'resolved', submitted: 'new', in_progress: 'open', waiting_on_customer: 'waiting_on_customer', resolved: 'resolved' };\nconst PRIO = (v) => { const s = String(v || '').toLowerCase(); return s === 'urgent' ? 'urgent' : s === 'high' || s === 'priority' ? 'high' : s === 'low' ? 'low' : s ? 'normal' : null; };\nconst SENT_LABEL = (x) => (x <= -1.5 ? 'very_negative' : x <= -0.5 ? 'negative' : x < 0.5 ? 'neutral' : x < 1.5 ? 'positive' : 'very_positive');\nconst PROVIDER_SENT = { very_negative: -2, negative: -1, neutral: 0, positive: 1, very_positive: 2, unknown: null };\nconst NEG = ['outage', 'down', 'broken', 'not working', \"doesn't work\", 'cannot', \"can't\", 'unable', 'error', 'locked out', 'refund', 'cancel', 'angry', 'frustrat', 'unacceptable', 'worst', 'terrible', 'urgent', 'asap', 'escalat', 'data loss', 'charged twice'];\nconst POS = ['thank', 'great', 'love', 'awesome', 'perfect', 'appreciate', 'excellent', 'quick question', 'how do i', 'feature request'];\nfunction lexicon(text) {\n  if (!text) return null;\n  const t = String(text).toLowerCase(); let s = 0;\n  for (const w of NEG) if (t.includes(w)) s -= 1;\n  for (const w of POS) if (t.includes(w)) s += 1;\n  if (/!!+/.test(t)) s -= 1;\n  if (/^[^a-z]*[A-Z\\s!]{12,}$/.test(String(text))) s -= 1; // shouting\n  return Math.max(-2, Math.min(2, s));\n}\n\nfunction fromZendesk(it) {\n  const p = it.json.payload || {}; const shape = it.json.shape;\n  let t; let occurredAt; let csat = null; let providerSent = null; let requester = null; let org = null; let requesterId = null; let orgId = null; let eventType = it.json.topic;\n  if (shape === 'zendesk_trigger') {\n    t = p.ticket || {}; occurredAt = iso(p.occurred_at) || iso(t.updated_at); eventType = `zendesk_trigger:${String(p.event || 'update').slice(0, 40)}`;\n    requester = t.requester ? { email: email(t.requester.email), name: t.requester.name || null } : null;\n    org = t.organization ? { name: t.organization.name || null, domain: domainOf(t.organization.domain) } : null;\n    if (t.satisfaction && t.satisfaction.score) csat = String(t.satisfaction.score).toLowerCase();\n    if (t.sentiment) providerSent = String(t.sentiment).toLowerCase().replace(/\\s+/g, '_');\n  } else if (shape === 'zendesk_event') {\n    t = p.detail || {}; occurredAt = iso(p.time) || iso(t.updated_at); requesterId = t.requester_id || null; orgId = t.organization_id || null;\n    if (p.type === 'zen:event-type:ticket.csat_received') { const c = (p.event && (p.event.current || p.event)) || {}; csat = String(c.score || c.rating || c.value || (typeof c === 'string' ? c : '') || '').toLowerCase() || null; }\n  } else {\n    t = p; occurredAt = iso(t.updated_at); requesterId = t.requester_id || null; orgId = t.organization_id || null;\n    requester = it.json.sideload && it.json.sideload.requester ? { email: email(it.json.sideload.requester.email), name: it.json.sideload.requester.name || null } : null;\n    org = it.json.sideload && it.json.sideload.organization ? { name: it.json.sideload.organization.name, domain: domainOf(it.json.sideload.organization.domain) } : null;\n    if (t.satisfaction_rating && ['good', 'bad'].includes(String(t.satisfaction_rating.score))) csat = String(t.satisfaction_rating.score);\n    if (ZD_SENTIMENT_FIELD && Array.isArray(t.custom_fields)) { const f = t.custom_fields.find((x) => String(x.id) === ZD_SENTIMENT_FIELD); if (f && f.value) providerSent = String(f.value).toLowerCase(); }\n  }\n  const isCsatEvent = shape === 'zendesk_event' && p.type === 'zen:event-type:ticket.csat_received';\n  const statusChangeEvent = shape !== 'zendesk_event' || ['zen:event-type:ticket.status_changed', 'zen:event-type:ticket.created'].includes(p.type);\n  // A CSAT or priority event must not move the status or the resolution time.\n  const status = isCsatEvent ? null : ZD_STATUS[String(t.status || '').toLowerCase()] || null;\n  const csatScore = csat === 'good' ? 5 : csat === 'bad' ? 1 : Number(csat) >= 1 && Number(csat) <= 5 ? Number(csat) : null;\n  const resolvedAt = (status === 'resolved' || status === 'closed') && statusChangeEvent ? iso(t.solved_at) || occurredAt : null;\n  const channel = (t.via && (t.via.channel || t.via)) || t.channel || null;\n  return { source: 'zendesk', externalId: `zendesk:${t.id}`, number: String(t.id), subject: t.subject ? String(t.subject).slice(0, 250) : null, status, priority: PRIO(t.priority),\n    channel: typeof channel === 'string' ? channel.toLowerCase() : null, createdAt: iso(t.created_at), occurredAt, resolvedAt, firstResponseAt: null, csatScore, providerSentiment: providerSent,\n    requester: requester || (requesterId ? { email: null, name: null, zendeskUserId: String(requesterId) } : null), organization: org || (orgId ? { zendeskOrgId: String(orgId) } : null),\n    url: SUBDOMAIN && !/^YOUR_/.test(SUBDOMAIN) ? `https://${SUBDOMAIN}.zendesk.com/agent/tickets/${t.id}` : null, eventType, tags: Array.isArray(t.tags) ? t.tags.slice(0, 20) : [] };\n}\nfunction fromIntercom(it) {\n  const p = it.json.payload || {};\n  const c = it.json.shape === 'intercom_notification' ? (p.data && p.data.item) || {} : p;\n  const isTicket = c.type === 'ticket';\n  const author = (c.source && c.source.author) || {};\n  const stateKey = String(isTicket ? c.ticket_state || c.state || '' : c.state || '').toLowerCase();\n  let status = IC_STATE[stateKey] || (c.open === false ? 'resolved' : c.open ? 'open' : null);\n  if (it.json.topic === 'conversation.user.created' && status === 'open') status = 'new';\n  const stats = c.statistics || {};\n  const rating = c.conversation_rating && c.conversation_rating.rating ? Number(c.conversation_rating.rating) : null;\n  const occurredAt = iso(p.created_at) || iso(c.updated_at);\n  const resolvedAt = status === 'resolved' ? iso(stats.last_close_at) || iso(c.updated_at) || occurredAt : null;\n  const providerSent = IC_SENTIMENT_ATTR && c.custom_attributes ? c.custom_attributes[IC_SENTIMENT_ATTR] : null;\n  const subject = c.title || (c.source && c.source.subject ? String(c.source.subject).replace(/<[^>]+>/g, '') : null);\n  return { source: 'intercom', externalId: `intercom:${c.id}`, number: String(c.id), subject: subject ? String(subject).slice(0, 250) : null, status, priority: PRIO(c.priority === 'priority' ? 'high' : c.priority === 'not_priority' ? 'normal' : c.priority),\n    channel: (c.source && c.source.type) || (isTicket ? 'ticket' : 'conversation'), createdAt: iso(c.created_at), occurredAt, resolvedAt, firstResponseAt: iso(stats.first_admin_reply_at), csatScore: rating >= 1 && rating <= 5 ? rating : null,\n    providerSentiment: providerSent ? String(providerSent).toLowerCase() : null, requester: { email: email(author.email), name: author.name || null, intercomContactId: author.id || null }, organization: null,\n    url: !/^YOUR_/.test(IC_APP) ? `https://app.intercom.com/a/inbox/${encodeURIComponent(IC_APP)}/inbox/conversation/${c.id}` : null, eventType: it.json.topic, tags: ((c.tags && c.tags.tags) || []).map((x) => x.name).slice(0, 20) };\n}\n\nlet ledger = {};\ntry { const s = $getWorkflowStaticData('global'); ledger = PERSIST ? (s.supportEventLedger = s.supportEventLedger || {}) : JSON.parse(JSON.stringify(s.supportEventLedger || {})); } catch (e) { ledger = {}; }\nfor (const [k, v] of Object.entries(ledger)) if (!v || Date.now() - v.at > LEDGER_DAYS * 86400000) delete ledger[k];\n\nconst merged = {}; const order = []; const passthrough = [];\nfor (const it of items) {\n  if (it.json.kind !== 'accepted') { passthrough.push(it); continue; }\n  let t;\n  try { t = it.json.source === 'zendesk' ? fromZendesk(it) : fromIntercom(it); } catch (e) { passthrough.push({ json: { ...it.json, kind: 'ignored', reason: 'unparseable_payload', payload: undefined } }); continue; }\n  if (!t.number || t.number === 'undefined') { passthrough.push({ json: { ...it.json, kind: 'ignored', reason: 'missing_ticket_id', payload: undefined } }); continue; }\n  const key = `${t.externalId}:${t.occurredAt}:${t.eventType}:${t.csatScore ?? ''}`;\n  if (ledger[key]) { passthrough.push({ json: { ...it.json, kind: 'ignored', reason: 'duplicate_event', payload: undefined, externalId: t.externalId } }); continue; }\n  t.ledgerKeys = [key]; t.origins = [it.json.origin]; t.events = [t.eventType];\n  const prev = merged[t.externalId];\n  if (!prev) { merged[t.externalId] = { t, base: it.json }; order.push(t.externalId); continue; }\n  const a = prev.t; const newer = (t.occurredAt || '') >= (a.occurredAt || '');\n  const keep = newer ? { ...a, ...Object.fromEntries(Object.entries(t).filter(([, v]) => v !== null && v !== undefined)) } : { ...t, ...Object.fromEntries(Object.entries(a).filter(([, v]) => v !== null && v !== undefined)) };\n  keep.csatScore = t.csatScore ?? a.csatScore; keep.providerSentiment = t.providerSentiment || a.providerSentiment; keep.createdAt = a.createdAt || t.createdAt;\n  keep.requester = { ...(a.requester || {}), ...Object.fromEntries(Object.entries(t.requester || {}).filter(([, v]) => v)) };\n  keep.organization = a.organization || t.organization;\n  keep.ledgerKeys = [...a.ledgerKeys, key]; keep.origins = [...new Set([...a.origins, ...t.origins])]; keep.events = [...a.events, t.eventType];\n  prev.t = keep;\n}\n\nconst out = [...passthrough];\nfor (const id of order) {\n  const { t, base } = merged[id];\n  let sentiment; let source;\n  if (t.csatScore) { sentiment = (t.csatScore - 3); source = 'csat'; }\n  else if (t.providerSentiment && PROVIDER_SENT[t.providerSentiment] !== undefined && PROVIDER_SENT[t.providerSentiment] !== null) { sentiment = PROVIDER_SENT[t.providerSentiment]; source = 'provider'; }\n  else if (LEXICON && t.subject) { sentiment = lexicon(t.subject); source = 'subject_lexicon'; }\n  else { sentiment = null; source = 'none'; }\n  const resolutionMinutes = t.resolvedAt && t.createdAt ? Math.max(0, Math.round((Date.parse(t.resolvedAt) - Date.parse(t.createdAt)) / 60000)) : null;\n  const firstResponseMinutes = t.firstResponseAt && t.createdAt ? Math.max(0, Math.round((Date.parse(t.firstResponseAt) - Date.parse(t.createdAt)) / 60000)) : null;\n  const companyDomain = (t.organization && t.organization.domain) || domainOf(t.requester && t.requester.email);\n  out.push({ json: { run: base.run, sandboxFixtures: base.sandboxFixtures, kind: 'ticket', origin: t.origins.join('+'), deliveryRef: base.deliveryRef,\n    ticket: { ...t, sentimentScore: sentiment, sentimentLabel: sentiment === null ? null : SENT_LABEL(sentiment), sentimentSource: source, resolutionMinutes, firstResponseMinutes, companyDomain,\n      needsRequesterLookup: t.source === 'zendesk' && (!t.requester || !t.requester.email) && !!(t.requester && t.requester.zendeskUserId) } } });\n}\nreturn out;\n"
+      },
+      "id": "143f85ad-84fb-5c2c-adfb-feff70c61099",
+      "name": "Ticket Normalizer & Sentiment Evaluator",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        300
+      ],
+      "notes": "5 shapes → unified ticket · resolution minutes · CSAT · sentiment · batch merge · ledger."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "190ff807-708d-5648-8ef0-272ea5c5797d",
+              "leftValue": "={{ $json.kind }}",
+              "rightValue": "ticket",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "7e7e8188-b8f5-5771-8423-e6bb14164db8",
+      "name": "Is Ticket?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1920,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "d3305499-2a98-5dca-9f20-7c75f57338bd",
+              "leftValue": "={{ $json.ticket.needsRequesterLookup && !$json.run.sandboxMode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ee8dc74f-aab1-567e-bd3a-3520a98778e5",
+      "name": "Needs Requester Lookup?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2160,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://{{ $env.ZENDESK_SUBDOMAIN }}.zendesk.com/api/v2/users/{{ encodeURIComponent($json.ticket.requester.zendeskUserId) }}.json",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Basic ' + (($env.ZENDESK_EMAIL || '') + '/token:' + ($env.ZENDESK_API_TOKEN || '')).base64Encode() }}"
+            }
+          ]
+        }
+      },
+      "id": "8c5029aa-beb4-593f-84e3-67a0d950c738",
+      "name": "Fetch Zendesk Requester",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2400,
+        420
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "Event webhooks carry requester_id only · e-mail + name kept."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Merge Requester                       Mode: Run Once for Each Item\n// Zendesk event webhooks carry requester_id but no e-mail. Live runs fetch\n// GET /api/v2/users/{id}.json; the sandbox uses fictional users. Only the\n// e-mail and display name are kept.\n// ─────────────────────────────────────────────────────────────────────\nconst email = (v) => { const s = String(v || '').trim().toLowerCase(); return /^[^@\\s]+@[^@\\s]+\\.[a-z]{2,}$/.test(s) ? s : null; };\nconst FREE = new Set(['gmail.com', 'googlemail.com', 'outlook.com', 'hotmail.com', 'live.com', 'yahoo.com', 'icloud.com', 'me.com', 'aol.com', 'proton.me', 'protonmail.com', 'gmx.com']);\nconst fromHttp = !($json && $json.kind === 'ticket');\nconst item = fromHttp ? $('Needs Requester Lookup?').item.json : $json;\nconst t = { ...item.ticket };\nlet user = null; let lookup = 'not_needed';\nif (t.needsRequesterLookup) {\n  if (fromHttp) { const r = $json || {}; user = Number(r.statusCode) === 200 && r.body && r.body.user ? r.body.user : null; lookup = user ? 'zendesk_api' : `failed_${r.statusCode || 'network'}`; }\n  else if (item.run.sandboxMode && item.sandboxFixtures) { user = (item.sandboxFixtures.zendeskUsers || {})[t.requester.zendeskUserId] || null; lookup = user ? 'sandbox_fixture' : 'not_found'; }\n  else lookup = 'skipped';\n}\nif (user) {\n  t.requester = { ...t.requester, email: email(user.email), name: user.name || null };\n  if (!t.companyDomain && t.requester.email) { const d = t.requester.email.split('@')[1]; if (!FREE.has(d)) t.companyDomain = d; }\n}\nt.requesterLookup = lookup;\nreturn { json: { ...item, ticket: t } };\n"
+      },
+      "id": "283e18c9-35f5-5c0f-a5d7-3bc9955f4f11",
+      "name": "Merge Requester",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build HubSpot Lookup                  Mode: Run Once for Each Item\n// Contact by requester e-mail · company by domain · existing ticket by\n// support_external_id (zendesk:123 / intercom:456).\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst P = env('SUPPORT_PROPERTY_PREFIX', 'support_');\nconst t = $json.ticket;\nconst noop = { filterGroups: [{ filters: [{ propertyName: 'hs_object_id', operator: 'EQ', value: '0' }] }], limit: 1 };\nconst eq = (p, v) => ({ filters: [{ propertyName: p, operator: 'EQ', value: v }] });\nconst e = t.requester && t.requester.email;\nreturn { json: { ...$json, prefix: P, lookup: {\n  noop,\n  contact: e ? { filterGroups: [eq('email', e), { filters: [{ propertyName: 'hs_additional_emails', operator: 'CONTAINS_TOKEN', value: e }] }], properties: ['email', 'associatedcompanyid'], limit: 3 } : noop,\n  company: t.companyDomain ? { filterGroups: [eq('domain', t.companyDomain), eq('domain', `www.${t.companyDomain}`)], properties: ['name', 'domain'], limit: 5 } : noop,\n  ticket: { filterGroups: [eq(`${P}external_id`, t.externalId)], properties: ['subject', 'hs_pipeline', 'hs_pipeline_stage', ...['external_id', 'last_event_at', 'csat_score', 'status_unified', 'sentiment_score', 'company_id', 'contact_id'].map((x) => `${P}${x}`)], limit: 2 },\n} } };\n"
+      },
+      "id": "2c3443c2-c285-5f73-bcae-effc29f8e830",
+      "name": "Build HubSpot Lookup",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2880,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "ec555df9-230f-5c87-992b-66b1304c0b33",
+              "leftValue": "={{ $json.run.sandboxMode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "8e40b8bd-5925-56d4-a334-e2fd951a5f23",
+      "name": "Sandbox HubSpot?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3120,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Simulate HubSpot Lookup (Sandbox)     Mode: Run Once for Each Item\n// ─────────────────────────────────────────────────────────────────────\nconst item = $json; const fx = item.sandboxFixtures || {}; const t = item.ticket; const P = item.prefix;\nconst ok = (list) => ({ statusCode: 200, body: { total: list.length, results: list.map((x) => ({ id: x.id, properties: x.properties })) } });\nconst e = t.requester && t.requester.email;\nconst contacts = e ? (fx.contacts || []).filter((c) => c.properties.email === e) : [];\nconst companies = t.companyDomain ? (fx.companies || []).filter((c) => String(c.properties.domain).replace(/^www\\./, '') === t.companyDomain) : [];\nconst tickets = (fx.tickets || []).filter((x) => x.properties[`${P}external_id`] === t.externalId);\nreturn { json: { ...item, simulatedLookup: { contact: ok(contacts), company: ok(companies), ticket: ok(tickets) } } };\n"
+      },
+      "id": "9b71d097-3046-5494-81c6-0141ebd7bfcf",
+      "name": "Simulate HubSpot Lookup (Sandbox)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3360,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com' }}/crm/v3/objects/contacts/search",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.lookup.contact) }}"
+      },
+      "id": "8941c59a-96b5-5642-9937-cc745648d04f",
+      "name": "Search Contact by Email",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3360,
+        420
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com' }}/crm/v3/objects/companies/search",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Build HubSpot Lookup').item.json.lookup.company) }}"
+      },
+      "id": "0628f2f1-d6b6-51a8-a821-5862b4d7631e",
+      "name": "Search Company by Domain",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3600,
+        420
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com' }}/crm/v3/objects/tickets/search",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Build HubSpot Lookup').item.json.lookup.ticket) }}"
+      },
+      "id": "4bab8a01-0a8a-5b14-894b-a971a887d19d",
+      "name": "Search Existing Ticket",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3840,
+        420
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "support_external_id EQ zendesk:… / intercom:…"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Plan HubSpot Ticket                   Mode: Run Once for Each Item\n// Creates the ticket (with contact + company associations in the same call)\n// or updates the existing one found by support_external_id. Only metadata\n// is written: subject (optional), status, priority, channel, timings, CSAT,\n// sentiment and a link back. Conversation text is never copied.\n// Out-of-order guard: an event older than support_last_event_at is skipped\n// unless it carries a new CSAT rating.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst PIPELINE = env('HUBSPOT_TICKET_PIPELINE_ID', '0');\nconst SYNC_SUBJECT = flag('SYNC_TICKET_SUBJECTS', true);\nlet STAGES = { new: '1', open: '3', waiting_on_customer: '2', on_hold: '3', resolved: '4', closed: '4' };\ntry { const j = JSON.parse(env('HUBSPOT_STAGE_MAP_JSON', '')); if (j && typeof j === 'object') STAGES = { ...STAGES, ...j }; } catch (e) { /* defaults */ }\nlet PRIORITIES = { low: 'LOW', normal: 'MEDIUM', high: 'HIGH', urgent: 'HIGH' };\ntry { const j = JSON.parse(env('HUBSPOT_PRIORITY_MAP_JSON', '')); if (j && typeof j === 'object') PRIORITIES = { ...PRIORITIES, ...j }; } catch (e) { /* defaults */ }\n\nconst sandbox = !!($json && $json.simulatedLookup);\nconst ctx = sandbox ? $json : $('Build HubSpot Lookup').item.json;\nconst res = sandbox ? $json.simulatedLookup : { contact: $('Search Contact by Email').item.json, company: $('Search Company by Domain').item.json, ticket: $json };\nconst P = ctx.prefix; const t = ctx.ticket;\nconst errors = [];\nconst list = (name, r, used) => { if (!used) return []; if (Number(r && r.statusCode) !== 200 || !r.body || !Array.isArray(r.body.results)) { errors.push(`${name} search ${(r && r.statusCode) || 'network error'}`); return []; } return r.body.results; };\nconst isNoop = (b) => JSON.stringify(b) === JSON.stringify(ctx.lookup.noop);\nconst contacts = list('contact', res.contact, !isNoop(ctx.lookup.contact));\nconst companies = list('company', res.company, !isNoop(ctx.lookup.company));\nconst tickets = list('ticket', res.ticket, true);\nconst contact = contacts[0] ? { id: String(contacts[0].id), associatedCompanyId: contacts[0].properties && contacts[0].properties.associatedcompanyid ? String(contacts[0].properties.associatedcompanyid) : null } : null;\nlet company = companies[0] ? { id: String(companies[0].id), name: companies[0].properties.name || null, matchedOn: 'domain' } : null;\nif (!company && contact && contact.associatedCompanyId) company = { id: contact.associatedCompanyId, name: null, matchedOn: 'contact_primary_company' };\nconst existing = tickets[0] ? { id: String(tickets[0].id), properties: tickets[0].properties || {} } : null;\n// Events without requester details (e.g. a Zendesk CSAT event) fall back to the records stored on the synced ticket.\nif (!company && existing && existing.properties[`${P}company_id`]) company = { id: String(existing.properties[`${P}company_id`]), name: null, matchedOn: 'existing_ticket' };\nlet contactFromTicket = false;\nif (!contact && existing && existing.properties[`${P}contact_id`]) { contactFromTicket = true; }\n\nconst holds = []; const notes = [];\nconst lastEvent = existing ? Date.parse(existing.properties[`${P}last_event_at`] || '') : NaN;\nconst newCsat = t.csatScore !== null && t.csatScore !== undefined && String(t.csatScore) !== String(existing ? existing.properties[`${P}csat_score`] ?? '' : '');\nconst stale = existing && Number.isFinite(lastEvent) && t.occurredAt && Date.parse(t.occurredAt) < lastEvent;\nif (errors.length) holds.push(`lookup errors: ${errors.join('; ')}`);\nif (stale && !newCsat) holds.push('older than the last event already applied');\nif (!contact && !contactFromTicket) notes.push(t.requester && t.requester.email ? 'requester not found in HubSpot: ticket not associated with a contact' : 'no requester e-mail');\nif (!company) notes.push(t.companyDomain ? 'company domain not found in HubSpot' : 'no company domain (free mailbox or unknown)');\n\nconst props = { [`${P}external_id`]: t.externalId, [`${P}source`]: t.source, [`${P}last_event_at`]: t.occurredAt, [`${P}last_event_type`]: String(t.events[t.events.length - 1] || '').slice(0, 100) };\nconst set = (k, v) => { if (v !== null && v !== undefined && v !== '') props[k] = v; };\nif (!(stale && newCsat)) {\n  if (t.status) { set(`${P}status_unified`, t.status); set('hs_pipeline_stage', STAGES[t.status]); }\n  if (t.priority) { set(`${P}priority_unified`, t.priority); set('hs_ticket_priority', PRIORITIES[t.priority]); }\n  set(`${P}channel`, t.channel); set(`${P}created_at`, t.createdAt); set(`${P}resolved_at`, t.resolvedAt); set(`${P}resolution_minutes`, t.resolutionMinutes);\n  set(`${P}first_response_minutes`, t.firstResponseMinutes); set(`${P}external_url`, t.url); set(`${P}requester_domain`, t.companyDomain);\n  if (SYNC_SUBJECT && t.subject) set('subject', t.subject);\n}\nif (company) set(`${P}company_id`, company.id);\nif (contact) set(`${P}contact_id`, contact.id);\nset(`${P}csat_score`, t.csatScore);\nif (t.sentimentScore !== null && t.sentimentScore !== undefined && (t.sentimentSource !== 'subject_lexicon' || !existing || existing.properties[`${P}sentiment_score`] === null || existing.properties[`${P}sentiment_score`] === undefined || t.csatScore)) {\n  set(`${P}sentiment_score`, t.sentimentScore); set(`${P}sentiment_label`, t.sentimentLabel); set(`${P}sentiment_source`, t.sentimentSource);\n}\nif (!existing) {\n  props.hs_pipeline = PIPELINE;\n  if (!props.hs_pipeline_stage) props.hs_pipeline_stage = STAGES.new;\n  if (!props.subject) props.subject = `${t.source === 'zendesk' ? 'Zendesk ticket' : 'Intercom conversation'} #${t.number}`;\n  props.content = `Synced from ${t.source === 'zendesk' ? 'Zendesk' : 'Intercom'} ${t.source === 'zendesk' ? 'ticket' : 'conversation'} #${t.number}. Conversation text stays in ${t.source === 'zendesk' ? 'Zendesk' : 'Intercom'}${t.url ? `: ${t.url}` : '.'}`;\n}\nconst write = holds.length === 0;\nconst associations = [];\nif (contact) associations.push({ to: { id: contact.id }, types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 16 }] });\nif (company) associations.push({ to: { id: company.id }, types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 26 }] });\nconst { simulatedLookup, lookup, ...rest } = ctx;\nreturn {\n  json: {\n    ...rest,\n    match: { contactId: contact ? contact.id : null, companyId: company ? company.id : null, companyName: company ? company.name : null, companyMatchedOn: company ? company.matchedOn : null, existingTicketId: existing ? existing.id : null, errors },\n    plan: { write, action: existing ? 'update' : 'create', holds, notes, properties: props, csatOnly: !!(stale && newCsat) },\n    requests: write ? (existing\n      ? { path: '/crm/v3/objects/tickets/batch/update', body: { inputs: [{ id: existing.id, properties: props }] }, associateContact: !!contact, associateCompany: !!company }\n      : { path: '/crm/v3/objects/tickets/batch/create', body: { inputs: [{ properties: props, associations }] }, associateContact: false, associateCompany: false }) : null,\n  },\n};\n"
+      },
+      "id": "788b27bf-1063-5f59-8da5-072ec71f19b9",
+      "name": "Plan HubSpot Ticket",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4080,
+        300
+      ],
+      "notes": "Create (with associations 16/26) or update · stage & priority maps · stale guard."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "19f9af18-ba3f-5dae-bc1b-dc85b03436f9",
+              "leftValue": "={{ $json.plan.write }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b8f78a0b-fdf3-5ff5-b1b5-0d568fa6421a",
+      "name": "Has Ticket Write?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4320,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "1ce6c079-d115-5e9b-8243-4f6c9319fdd5",
+              "leftValue": "={{ !$json.run.sandboxMode && !$json.run.dryRun }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "bcd5b1b1-4c67-5d1e-b8c9-2da13207347b",
+      "name": "Live Writes?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4560,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Simulate Ticket Write (Dry Run)       Mode: Run Once for Each Item\n// ─────────────────────────────────────────────────────────────────────\nconst item = $json; const { requests, ...rest } = item;\nreturn { json: { ...rest, kind: 'ticket_synced', sync: { simulated: true, ok: true, mode: item.run.mode, action: item.plan.action, ticketId: item.match.existingTicketId || `sandbox-new-${item.ticket.externalId}`,\n  associated: { contact: !!item.match.contactId, company: !!item.match.companyId } }, preview: { path: requests.path, properties: item.plan.properties } } };\n"
+      },
+      "id": "847ff6fb-f76f-5a19-95cb-0c3ad7675801",
+      "name": "Simulate Ticket Write (Dry Run)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4800,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com' }}{{ $json.requests.path }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.requests.body) }}"
+      },
+      "id": "15b6aa8b-3b9d-5bed-af42-9da163973651",
+      "name": "Write HubSpot Ticket",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4800,
+        340
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "batch/create (new, with associations) or batch/update (existing) · creates aren't auto-retried."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Capture Ticket Result                 Mode: Run Once for Each Item\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['ZENDESK_WEBHOOK_SECRET', 'ZENDESK_API_TOKEN', 'INTERCOM_CLIENT_SECRET', 'INTERCOM_ACCESS_TOKEN', 'HUBSPOT_ACCESS_TOKEN', 'SLACK_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/\\bya29\\.[A-Za-z0-9_\\-.]{10,}/g, '[REDACTED_GOOGLE_TOKEN]')\n    .replace(/\\b1\\/\\/[A-Za-z0-9_\\-]{20,}/g, '[REDACTED_REFRESH_TOKEN]')\n    .replace(/\\bAIza[0-9A-Za-z_\\-]{30,40}/g, '[REDACTED_API_KEY]')\n    .replace(/\\bGOCSPX-[A-Za-z0-9_\\-]{10,}/g, '[REDACTED_CLIENT_SECRET]')\n    .replace(/\\beyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{4,}/g, '[REDACTED_JWT]')\n    .replace(/Basic\\s+[A-Za-z0-9+\\/]{8,}=*/gi, 'Basic [REDACTED]')\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:api_key|apikey|key|token|secret|signature|sig|X-Amz-Signature|Expires)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\nconst maskPhone = (p) => { const d = String(p || '').replace(/\\D/g, ''); return d.length >= 4 ? `+${d.length > 10 ? d.slice(0, d.length - 10) : ''}•••••${d.slice(-4)}` : null; };\nconst ctx = $('Live Writes?').item.json;\nconst res = $json || {};\nconst status = Number(res.statusCode || 0);\nconst errs = res.body && Array.isArray(res.body.errors) ? res.body.errors : [];\nconst id = status >= 200 && status < 300 && !errs.length && res.body && Array.isArray(res.body.results) && res.body.results[0] ? String(res.body.results[0].id) : null;\nconst ok = !!id;\nreturn { json: { ...ctx, ticketWrite: { ok, ticketId: id, httpStatus: status || null, message: ok ? null : redactString((errs[0] && errs[0].message) || (res.body && res.body.message) || 'ticket write failed').slice(0, 200) },\n  associateContact: ok && ctx.requests.associateContact, associateCompany: ok && ctx.requests.associateCompany } };\n"
+      },
+      "id": "4cd37736-ca4f-5189-86e7-5dd11d49a725",
+      "name": "Capture Ticket Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5040,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "fac3ccd3-71fb-58cb-b391-2526ff371a6d",
+              "leftValue": "={{ $json.associateContact }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "03e00660-f6fa-5b83-a6d4-0840bcf29306",
+      "name": "Associate Contact?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5280,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com' }}/crm/v4/objects/tickets/{{ $json.ticketWrite.ticketId }}/associations/default/contacts/{{ $json.match.contactId }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "PUT",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            }
+          ]
+        }
+      },
+      "id": "2cefee48-9eaf-5a73-8347-bc3c10e9d3aa",
+      "name": "Associate Ticket to Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        5520,
+        260
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "39021633-36a1-5f1b-8e30-b15a9de4845d",
+              "leftValue": "={{ $('Capture Ticket Result').item.json.associateCompany }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "e7bf6af5-8375-53a0-96b2-4f635465eb5b",
+      "name": "Associate Company?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5760,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com' }}/crm/v4/objects/tickets/{{ $('Capture Ticket Result').item.json.ticketWrite.ticketId }}/associations/default/companies/{{ $('Capture Ticket Result').item.json.match.companyId }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "PUT",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            }
+          ]
+        }
+      },
+      "id": "04fd698a-7f4c-5ffd-84c5-297b7dad49c5",
+      "name": "Associate Ticket to Company",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        6000,
+        260
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Record Ticket Sync                    Mode: Run Once for Each Item\n// Collects the ticket write and association results and records the\n// processed events in the idempotency ledger once the ticket was saved.\n// ─────────────────────────────────────────────────────────────────────\nconst ctx = $('Capture Ticket Result').item.json;\nconst assoc = (node, wanted) => { if (!wanted) return null; try { const r = $(node).item.json; const s = Number(r.statusCode || 0); return s >= 200 && s < 300; } catch (e) { return false; } };\nconst contactOk = assoc('Associate Ticket to Contact', ctx.associateContact);\nconst companyOk = assoc('Associate Ticket to Company', ctx.associateCompany);\nconst ok = ctx.ticketWrite.ok && contactOk !== false && companyOk !== false;\nif (ctx.ticketWrite.ok) {\n  try { const s = $getWorkflowStaticData('global'); s.supportEventLedger = s.supportEventLedger || {}; for (const k of ctx.ticket.ledgerKeys) s.supportEventLedger[k] = { at: Date.now() }; } catch (e) { /* best effort */ }\n}\nconst { requests, ...rest } = ctx;\nreturn { json: { ...rest, kind: 'ticket_synced', sync: { simulated: false, ok, mode: 'live', action: ctx.plan.action, ticketId: ctx.ticketWrite.ticketId, httpStatus: ctx.ticketWrite.httpStatus, message: ctx.ticketWrite.message,\n  associated: { contact: ctx.plan.action === 'create' ? !!ctx.match.contactId : contactOk, company: ctx.plan.action === 'create' ? !!ctx.match.companyId : companyOk } } } };\n"
+      },
+      "id": "39652f20-e244-573f-a19e-aeea8c49edd8",
+      "name": "Record Ticket Sync",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6240,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Group Tickets by Account              Mode: Run Once for All Items\n// Passes every ticket through for the audit log and emits one rollup item\n// per HubSpot company touched in this run (with this batch's volume by\n// source, priority and sentiment).\n// ─────────────────────────────────────────────────────────────────────\nconst items = $input.all();\nconst out = []; const groups = {};\nfor (const it of items) {\n  const j = it.json;\n  out.push({ json: { ...j, sandboxFixtures: undefined } });\n  if (!j.sync || !j.sync.ok || !j.match || !j.match.companyId) continue;\n  const g = (groups[j.match.companyId] = groups[j.match.companyId] || { companyId: j.match.companyId, companyName: j.match.companyName, run: j.run, sandboxFixtures: j.sandboxFixtures, prefix: j.prefix,\n    batch: { tickets: 0, bySource: {}, negative: 0, urgentOrHigh: 0 }, batchTickets: [] });\n  g.batch.tickets++; g.batch.bySource[j.ticket.source] = (g.batch.bySource[j.ticket.source] || 0) + 1;\n  if (j.ticket.sentimentScore !== null && j.ticket.sentimentScore < 0) g.batch.negative++;\n  if (['high', 'urgent'].includes(j.ticket.priority)) g.batch.urgentOrHigh++;\n  g.batchTickets.push({ id: j.sync.ticketId, properties: j.plan.properties });\n}\nfor (const g of Object.values(groups)) {\n  const P = g.prefix;\n  g.ticketSearch = { filterGroups: [{ filters: [{ propertyName: 'associations.company', operator: 'EQ', value: g.companyId }, { propertyName: `${P}external_id`, operator: 'HAS_PROPERTY' }] }],\n    properties: ['createdate', 'hs_pipeline_stage', ...['external_id', 'source', 'status_unified', 'priority_unified', 'created_at', 'resolved_at', 'resolution_minutes', 'csat_score', 'sentiment_score', 'last_event_at'].map((x) => `${P}${x}`)],\n    sorts: [{ propertyName: 'createdate', direction: 'DESCENDING' }], limit: 100 };\n  out.push({ json: { kind: 'company_rollup', ...g } });\n}\nreturn out;\n"
+      },
+      "id": "4c147e10-50aa-5bcb-9669-eb2e339ee016",
+      "name": "Group Tickets by Account",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6480,
+        220
+      ],
+      "notes": "Ticket items pass through · one rollup item per company."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "9a5add26-fd82-52eb-8887-ef68daf434e9",
+              "leftValue": "={{ $json.kind }}",
+              "rightValue": "company_rollup",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "9e1b98a9-bbdf-5db7-a0bb-e37ccdbacce4",
+      "name": "Is Company Rollup?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        6720,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "b56de424-a4ca-5489-8c5c-152be7a3ac51",
+              "leftValue": "={{ $json.run.sandboxMode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "910726c2-91d2-535c-95c2-d68ab05c1523",
+      "name": "Sandbox Rollup?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        6960,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Simulate Company Ticket Search (Sandbox)  Mode: Run Once for Each Item\n// Fictional synced tickets already on the company, merged with this run's\n// planned writes, in the CRM search response shape.\n// ─────────────────────────────────────────────────────────────────────\nconst item = $json; const fx = item.sandboxFixtures || {}; const P = item.prefix;\nconst existing = (fx.tickets || []).filter((t) => t.companyId === item.companyId);\nconst byExt = {};\nfor (const t of existing) byExt[t.properties[`${P}external_id`]] = { id: t.id, properties: { ...t.properties } };\nfor (const t of item.batchTickets) { const k = t.properties[`${P}external_id`]; byExt[k] = { id: (byExt[k] && byExt[k].id) || t.id, properties: { ...((byExt[k] && byExt[k].properties) || {}), ...t.properties } }; }\nconst results = Object.values(byExt);\nreturn { json: { ...item, simulatedTickets: { statusCode: 200, body: { total: results.length, results } } } };\n"
+      },
+      "id": "5eb4b93d-4a05-5dd1-94d6-5197a4cf64dc",
+      "name": "Simulate Company Ticket Search (Sandbox)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7200,
+        20
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com' }}/crm/v3/objects/tickets/search",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.ticketSearch) }}"
+      },
+      "id": "c952ce01-4fd5-5780-8004-da04f148c0ad",
+      "name": "Search Company Tickets",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        7200,
+        220
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "All synced tickets on the company (both platforms), newest 100."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Compute Account Health                Mode: Run Once for Each Item\n// Rolls every synced ticket on the company (both platforms, up to 100 most\n// recent) into account health properties:\n//   open tickets · urgent/high open · tickets 30 d · avg resolution hours 90 d\n//   · CSAT avg 90 d (1–5) · sentiment avg 30 d (−2…+2) + grade A–F\n//   · negative tickets 30 d · health score 0–100 + status\n// Score: 100 − open-backlog − urgent − negative-share − CSAT − resolution penalties.\n//   healthy ≥ HEALTH_HEALTHY_MIN (75) · watch ≥ HEALTH_WATCH_MIN (50) · at_risk below.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst FREE_OPEN = num('HEALTH_FREE_OPEN_TICKETS', 2);\nconst TARGET_H = Math.max(1, num('RESOLUTION_TARGET_HOURS', 24));\nconst HEALTHY = num('HEALTH_HEALTHY_MIN', 75); const WATCH = num('HEALTH_WATCH_MIN', 50);\nconst sandbox = !!($json && $json.simulatedTickets);\nconst ctx = sandbox ? $json : $('Is Company Rollup?').item.json;\nconst res = sandbox ? $json.simulatedTickets : $json;\nconst P = ctx.prefix;\nconst nowMs = ctx.sandboxFixtures && ctx.sandboxFixtures.now ? Date.parse(ctx.sandboxFixtures.now) : Date.now();\nif (Number(res && res.statusCode) !== 200 || !res.body || !Array.isArray(res.body.results)) {\n  return { json: { ...ctx, sandboxFixtures: undefined, simulatedTickets: undefined, health: null, healthError: `company ticket search ${(res && res.statusCode) || 'network error'}`, healthWrite: null } };\n}\nconst T = res.body.results.map((r) => r.properties || {});\nconst num_ = (v) => { const n = Number(v); return v === null || v === undefined || v === '' || !Number.isFinite(n) ? null : n; };\nconst ageDays = (v) => { const ms = Date.parse(v || ''); return Number.isFinite(ms) ? (nowMs - ms) / 86400000 : Infinity; };\nconst OPEN = ['new', 'open', 'waiting_on_customer', 'on_hold'];\nconst open = T.filter((t) => OPEN.includes(t[`${P}status_unified`]));\nconst urgentOpen = open.filter((t) => ['urgent', 'high'].includes(t[`${P}priority_unified`]));\nconst created = (t) => t[`${P}created_at`] || t.createdate;\nconst last30 = T.filter((t) => ageDays(created(t)) <= 30);\nconst resolved90 = T.filter((t) => num_(t[`${P}resolution_minutes`]) !== null && ageDays(t[`${P}resolved_at`]) <= 90);\nconst csat90 = T.filter((t) => num_(t[`${P}csat_score`]) !== null && ageDays(t[`${P}last_event_at`] || created(t)) <= 90);\nconst sent30 = last30.filter((t) => num_(t[`${P}sentiment_score`]) !== null);\nconst avg = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);\nconst r2 = (v) => (v === null ? null : Math.round(v * 100) / 100);\nconst avgResH = avg(resolved90.map((t) => num_(t[`${P}resolution_minutes`]) / 60));\nconst csatAvg = avg(csat90.map((t) => num_(t[`${P}csat_score`])));\nconst sentAvg = avg(sent30.map((t) => num_(t[`${P}sentiment_score`])));\nconst negative30 = sent30.filter((t) => num_(t[`${P}sentiment_score`]) < 0).length;\nconst grade = sentAvg === null ? null : sentAvg >= 0.75 ? 'A' : sentAvg >= 0.25 ? 'B' : sentAvg > -0.25 ? 'C' : sentAvg > -0.75 ? 'D' : 'F';\n\nconst penalties = {\n  openBacklog: Math.min(25, Math.max(0, open.length - FREE_OPEN) * 5),\n  urgentOpen: Math.min(15, urgentOpen.length * 5),\n  negativeShare: sent30.length ? Math.round((negative30 / sent30.length) * 30) : 0,\n  csat: csatAvg !== null && csatAvg < 4 ? Math.min(30, Math.round((4 - csatAvg) * 10)) : 0,\n  resolution: avgResH !== null && avgResH > TARGET_H ? Math.min(20, Math.round((avgResH / TARGET_H - 1) * 10)) : 0,\n};\nconst score = Math.max(0, 100 - Object.values(penalties).reduce((a, b) => a + b, 0));\nconst status = score >= HEALTHY ? 'healthy' : score >= WATCH ? 'watch' : 'at_risk';\nconst lastTicketAt = T.map((t) => t[`${P}last_event_at`]).filter(Boolean).sort().pop() || null;\nconst health = { openTickets: open.length, urgentOpenTickets: urgentOpen.length, tickets30d: last30.length, avgResolutionHours90d: r2(avgResH), csatAvg90d: r2(csatAvg), csatResponses90d: csat90.length,\n  sentimentScore30d: r2(sentAvg), sentimentGrade: grade, negativeTickets30d: negative30, healthScore: score, healthStatus: status, penalties, ticketsConsidered: T.length,\n  bySource: T.reduce((m, t) => { const s = t[`${P}source`] || 'unknown'; m[s] = (m[s] || 0) + 1; return m; }, {}) };\nconst properties = { [`${P}open_tickets`]: health.openTickets, [`${P}urgent_open_tickets`]: health.urgentOpenTickets, [`${P}tickets_30d`]: health.tickets30d,\n  [`${P}negative_tickets_30d`]: health.negativeTickets30d, [`${P}health_score`]: health.healthScore, [`${P}health_status`]: health.healthStatus, [`${P}health_updated_at`]: new Date(nowMs).toISOString() };\nif (health.avgResolutionHours90d !== null) properties[`${P}avg_resolution_hours_90d`] = health.avgResolutionHours90d;\nif (health.csatAvg90d !== null) properties[`${P}csat_avg_90d`] = health.csatAvg90d;\nif (health.sentimentScore30d !== null) { properties[`${P}sentiment_score_30d`] = health.sentimentScore30d; properties[`${P}sentiment_grade`] = health.sentimentGrade; }\nif (lastTicketAt) properties[`${P}last_ticket_at`] = lastTicketAt;\nconst { simulatedTickets, sandboxFixtures, batchTickets, ...rest } = ctx;\nreturn { json: { ...rest, health, healthWrite: { path: '/crm/v3/objects/companies/batch/update', body: { inputs: [{ id: ctx.companyId, properties }] } } } };\n"
+      },
+      "id": "5cc963e9-8e34-5dea-8ad6-02e3424d6ca2",
+      "name": "Compute Account Health",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7440,
+        120
+      ],
+      "notes": "Open · urgent · resolution · CSAT · sentiment grade · health score/status."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "bf7be4ae-9f99-597a-b8b5-bcc087c5e058",
+              "leftValue": "={{ !!$json.healthWrite }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b79ee758-c036-546b-9f22-4f75f1c6d403",
+      "name": "Has Health?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        7680,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "7bfad660-3a3c-50e9-b059-339373f419ae",
+              "leftValue": "={{ !$json.run.sandboxMode && !$json.run.dryRun }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a511f446-5185-51ae-a8c6-1d7ce0fc4608",
+      "name": "Live Health Write?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        7920,
+        60
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Simulate Health Write (Dry Run)       Mode: Run Once for Each Item\n// ─────────────────────────────────────────────────────────────────────\nconst item = $json;\nreturn { json: { ...item, healthSync: { simulated: true, ok: !!item.healthWrite, mode: item.run.mode, properties: item.healthWrite ? item.healthWrite.body.inputs[0].properties : null }, healthWrite: undefined } };\n"
+      },
+      "id": "3a20687a-9fd0-5304-9b46-a69cba4748a6",
+      "name": "Simulate Health Write (Dry Run)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        8160,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com' }}{{ $json.healthWrite.path }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.healthWrite.body) }}"
+      },
+      "id": "c4871360-e52a-57f2-ad65-676fba54558c",
+      "name": "Update Company Health",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        8160,
+        160
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Record Health Write                   Mode: Run Once for Each Item\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['ZENDESK_WEBHOOK_SECRET', 'ZENDESK_API_TOKEN', 'INTERCOM_CLIENT_SECRET', 'INTERCOM_ACCESS_TOKEN', 'HUBSPOT_ACCESS_TOKEN', 'SLACK_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/\\bya29\\.[A-Za-z0-9_\\-.]{10,}/g, '[REDACTED_GOOGLE_TOKEN]')\n    .replace(/\\b1\\/\\/[A-Za-z0-9_\\-]{20,}/g, '[REDACTED_REFRESH_TOKEN]')\n    .replace(/\\bAIza[0-9A-Za-z_\\-]{30,40}/g, '[REDACTED_API_KEY]')\n    .replace(/\\bGOCSPX-[A-Za-z0-9_\\-]{10,}/g, '[REDACTED_CLIENT_SECRET]')\n    .replace(/\\beyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{4,}/g, '[REDACTED_JWT]')\n    .replace(/Basic\\s+[A-Za-z0-9+\\/]{8,}=*/gi, 'Basic [REDACTED]')\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:api_key|apikey|key|token|secret|signature|sig|X-Amz-Signature|Expires)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\nconst maskPhone = (p) => { const d = String(p || '').replace(/\\D/g, ''); return d.length >= 4 ? `+${d.length > 10 ? d.slice(0, d.length - 10) : ''}•••••${d.slice(-4)}` : null; };\nconst ctx = $('Live Health Write?').item.json;\nconst r = $json || {}; const s = Number(r.statusCode || 0); const errs = r.body && Array.isArray(r.body.errors) ? r.body.errors : [];\nconst ok = s >= 200 && s < 300 && !errs.length;\nreturn { json: { ...ctx, healthWrite: undefined, healthSync: { simulated: false, ok, mode: 'live', httpStatus: s || null, message: ok ? null : redactString((errs[0] && errs[0].message) || (r.body && r.body.message) || 'company update failed').slice(0, 200) } } };\n"
+      },
+      "id": "370e091c-ce9e-5532-9eef-52bbb370b2c4",
+      "name": "Record Health Write",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        8400,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Audit Logger                          Mode: Run Once for Each Item\n// One redacted record per delivery, ticket or account rollup: IDs, statuses,\n// timings, scores and counts. Never ticket subjects, message text, names or\n// full e-mail addresses (domains only).\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['ZENDESK_WEBHOOK_SECRET', 'ZENDESK_API_TOKEN', 'INTERCOM_CLIENT_SECRET', 'INTERCOM_ACCESS_TOKEN', 'HUBSPOT_ACCESS_TOKEN', 'SLACK_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/\\bya29\\.[A-Za-z0-9_\\-.]{10,}/g, '[REDACTED_GOOGLE_TOKEN]')\n    .replace(/\\b1\\/\\/[A-Za-z0-9_\\-]{20,}/g, '[REDACTED_REFRESH_TOKEN]')\n    .replace(/\\bAIza[0-9A-Za-z_\\-]{30,40}/g, '[REDACTED_API_KEY]')\n    .replace(/\\bGOCSPX-[A-Za-z0-9_\\-]{10,}/g, '[REDACTED_CLIENT_SECRET]')\n    .replace(/\\beyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{4,}/g, '[REDACTED_JWT]')\n    .replace(/Basic\\s+[A-Za-z0-9+\\/]{8,}=*/gi, 'Basic [REDACTED]')\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:api_key|apikey|key|token|secret|signature|sig|X-Amz-Signature|Expires)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\nconst maskPhone = (p) => { const d = String(p || '').replace(/\\D/g, ''); return d.length >= 4 ? `+${d.length > 10 ? d.slice(0, d.length - 10) : ''}•••••${d.slice(-4)}` : null; };\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst RING_SIZE = Math.max(0, num('AUDIT_RING_BUFFER_SIZE', 500));\nconst LOG_TO_STDOUT = flag('AUDIT_LOG_TO_STDOUT', true);\nconst item = $json; const t = item.ticket || null;\nconst record = redact({\n  auditVersion: 1, at: new Date().toISOString(), workflowId: $workflow.id || null, executionId: $execution.id || null,\n  runId: item.run ? item.run.runId : null, mode: item.run ? item.run.mode : null, record: item.kind || null, origin: item.origin || null, source: item.source || (t && t.source) || null,\n  reason: item.reason || null, topic: item.topic || null,\n  ticket: t ? { externalId: t.externalId, status: t.status, priority: t.priority, channel: t.channel, events: t.events, resolutionMinutes: t.resolutionMinutes, firstResponseMinutes: t.firstResponseMinutes,\n    csat: t.csatScore, sentiment: t.sentimentScore, sentimentSource: t.sentimentSource, requesterDomain: t.requester && t.requester.email ? t.requester.email.split('@')[1] : null, requesterLookup: t.requesterLookup || null } : null,\n  match: item.match ? { contactId: item.match.contactId, companyId: item.match.companyId, companyMatchedOn: item.match.companyMatchedOn, existingTicketId: item.match.existingTicketId, errors: item.match.errors } : null,\n  plan: item.plan ? { write: item.plan.write, action: item.plan.action, holds: item.plan.holds, notes: item.plan.notes, propertyCount: Object.keys(item.plan.properties).length } : null,\n  sync: item.sync ? { simulated: item.sync.simulated, ok: item.sync.ok, action: item.sync.action, ticketId: item.sync.ticketId, associated: item.sync.associated, message: item.sync.message || null } : null,\n  company: item.kind === 'company_rollup' ? { companyId: item.companyId, batch: item.batch, health: item.health ? { ...item.health, penalties: item.health.penalties } : null, error: item.healthError || null,\n    write: item.healthSync ? { simulated: item.healthSync.simulated, ok: item.healthSync.ok, message: item.healthSync.message || null } : null } : null,\n});\nif (LOG_TO_STDOUT) { try { console.log(`[ticket-health] ${JSON.stringify(record)}`); } catch (e) { /* best effort */ } }\nif (RING_SIZE > 0 && !SANDBOX_MODE) {\n  try { const s = $getWorkflowStaticData('global'); if (!Array.isArray(s.supportHealthAudit)) s.supportHealthAudit = []; s.supportHealthAudit.push(record); if (s.supportHealthAudit.length > RING_SIZE) s.supportHealthAudit.splice(0, s.supportHealthAudit.length - RING_SIZE); } catch (e) { /* manual runs */ }\n}\nreturn { json: record };\n"
+      },
+      "id": "bfb8015d-10af-5e8a-9aac-46121ef093ad",
+      "name": "Audit Logger",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        8640,
+        300
+      ],
+      "notes": "IDs, statuses, timings, scores · never subjects or message text."
+    },
+    {
+      "parameters": {},
+      "id": "3b9c02b6-0b19-53df-bb82-b2bb2cbc5216",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        900
+      ],
+      "notes": "Fires when this workflow is selected as its own Error Workflow."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Sanitized Error Handler              Mode: Run Once for All Items\n// Fed by the Error Trigger when this workflow is its own Error Workflow.\n// Drops stack traces and request options, redacts secrets, and emits a\n// safe alert record (and optionally a minimal Slack notice).\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['ZENDESK_WEBHOOK_SECRET', 'ZENDESK_API_TOKEN', 'INTERCOM_CLIENT_SECRET', 'INTERCOM_ACCESS_TOKEN', 'HUBSPOT_ACCESS_TOKEN', 'SLACK_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/\\bya29\\.[A-Za-z0-9_\\-.]{10,}/g, '[REDACTED_GOOGLE_TOKEN]')\n    .replace(/\\b1\\/\\/[A-Za-z0-9_\\-]{20,}/g, '[REDACTED_REFRESH_TOKEN]')\n    .replace(/\\bAIza[0-9A-Za-z_\\-]{30,40}/g, '[REDACTED_API_KEY]')\n    .replace(/\\bGOCSPX-[A-Za-z0-9_\\-]{10,}/g, '[REDACTED_CLIENT_SECRET]')\n    .replace(/\\beyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{4,}/g, '[REDACTED_JWT]')\n    .replace(/Basic\\s+[A-Za-z0-9+\\/]{8,}=*/gi, 'Basic [REDACTED]')\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:api_key|apikey|key|token|secret|signature|sig|X-Amz-Signature|Expires)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\nconst maskPhone = (p) => { const d = String(p || '').replace(/\\D/g, ''); return d.length >= 4 ? `+${d.length > 10 ? d.slice(0, d.length - 10) : ''}•••••${d.slice(-4)}` : null; };\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\n\nreturn $input.all().map(({ json }) => {\n  const execution = json.execution || {};\n  const error = execution.error || (json.trigger && json.trigger.error) || {};\n  const alert = {\n    alertType: 'ticket_health_sync_execution_error',\n    at: new Date().toISOString(),\n    workflow: { id: json.workflow ? json.workflow.id : null, name: redactString(json.workflow ? json.workflow.name : '') },\n    execution: { id: execution.id || null, mode: execution.mode || null, retryOf: execution.retryOf || null },\n    lastNodeExecuted: execution.lastNodeExecuted || null,\n    errorName: redactString(error.name || 'Error'),\n    errorMessage: redactString(error.message || 'unknown error').slice(0, 300),\n    nextStep: 'Open the execution in n8n (restricted access) and check the node named in lastNodeExecuted.',\n  };\n  try { console.error(`[ticket-health:error] ${JSON.stringify(alert)}`); } catch (e) { /* best effort */ }\n  const notify = !SANDBOX_MODE && !DRY_RUN && env('SLACK_WEBHOOK_URL', '') !== '' && flag('SLACK_NOTIFY_ON_MONITOR_ERROR', true);\n  return {\n    json: {\n      ...alert,\n      notify,\n      slackMessage: {\n        text: `Support ticket health sync failed at ${alert.lastNodeExecuted || 'unknown node'}`,\n        blocks: [\n          { type: 'header', text: { type: 'plain_text', text: '⚠️ Support ticket health sync failed', emoji: true } },\n          { type: 'section', text: { type: 'mrkdwn', text: `*Node:* ${alert.lastNodeExecuted || 'unknown'}\\n*Error:* ${alert.errorName}: ${alert.errorMessage}` } },\n          { type: 'context', elements: [{ type: 'mrkdwn', text: `Execution \\`${alert.execution.id || 'n/a'}\\` · the reconciliation poll will pick up missed Zendesk and Intercom updates once this is fixed` }] },\n        ],\n      },\n    },\n  };\n});\n"
+      },
+      "id": "20d8b286-fc67-5c01-91d3-10b643e15dc1",
+      "name": "Sanitized Error Handler",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "e992a01b-e37e-5b4f-b9be-eca7e42af62f",
+              "leftValue": "={{ $json.notify }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "489c54ea-0f8a-5794-8e5e-e4c683e1cd4c",
+      "name": "Notify Execution Error?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "options": {
+          "timeout": 10000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slackMessage) }}"
+      },
+      "id": "fef1ce41-97ef-5fb2-b914-76b34de52717",
+      "name": "Post Execution Error Notice",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        840
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "## n8n-zendesk-intercom-hubspot-unified-ticket-health-sync\nZendesk + Intercom → unified tickets → HubSpot tickets → company health properties. dhRobin Systems.\n\n**Safe defaults:** `SANDBOX_MODE=true`, `DRY_RUN=true`. No Zendesk, Intercom or HubSpot calls until both are `false`.\n\n**Stage 1** Execute each trigger (Zendesk, Intercom, Reconcile Poll) with its pinned fictional data.\n**Stage 2** `SANDBOX_MODE=false`: real lookups, writes simulated.\n**Stage 3** `DRY_RUN=false`: tickets and account health go live.\n\nConversation text is never copied to HubSpot or the logs.",
+        "height": 320,
+        "width": 720,
+        "color": 4
+      },
+      "id": "5a260724-7474-5e63-a4ad-5b835b607704",
+      "name": "Sticky: Start Here",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -360
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Account health rollup\nEvery synced ticket on the company (both platforms) → open/urgent counts, resolution, CSAT, sentiment grade, health score.",
+        "height": 110,
+        "width": 640,
+        "color": 3
+      },
+      "id": "81e84f7e-c7bf-580b-b957-056bd4fa47d4",
+      "name": "Sticky: Health",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        6920,
+        -180
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Sanitized error path\nNo stack traces, headers or bodies. Tokens, client secrets and webhook URLs are redacted.",
+        "height": 90,
+        "width": 600,
+        "color": 2
+      },
+      "id": "cd8b2af9-0af6-5594-88dd-bdd04ad2d0a1",
+      "name": "Sticky: Errors",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        780
+      ]
+    }
+  ],
+  "connections": {
+    "Zendesk Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Verify & Unwrap Support Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Intercom Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Verify & Unwrap Support Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reconcile Poll": {
+      "main": [
+        [
+          {
+            "node": "Build Poll Window",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Poll Window": {
+      "main": [
+        [
+          {
+            "node": "Sandbox Poll?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sandbox Poll?": {
+      "main": [
+        [
+          {
+            "node": "Load Poll Fixtures (Sandbox)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Poll Zendesk Tickets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Poll Fixtures (Sandbox)": {
+      "main": [
+        [
+          {
+            "node": "Package Poll Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Poll Zendesk Tickets": {
+      "main": [
+        [
+          {
+            "node": "Poll Intercom Conversations",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Poll Intercom Conversations": {
+      "main": [
+        [
+          {
+            "node": "Package Poll Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Package Poll Results": {
+      "main": [
+        [
+          {
+            "node": "Accepted?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify & Unwrap Support Event": {
+      "main": [
+        [
+          {
+            "node": "Accepted?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Accepted?": {
+      "main": [
+        [
+          {
+            "node": "Ticket Normalizer & Sentiment Evaluator",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ticket Normalizer & Sentiment Evaluator": {
+      "main": [
+        [
+          {
+            "node": "Is Ticket?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Ticket?": {
+      "main": [
+        [
+          {
+            "node": "Needs Requester Lookup?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Requester Lookup?": {
+      "main": [
+        [
+          {
+            "node": "Fetch Zendesk Requester",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Merge Requester",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Zendesk Requester": {
+      "main": [
+        [
+          {
+            "node": "Merge Requester",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Requester": {
+      "main": [
+        [
+          {
+            "node": "Build HubSpot Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build HubSpot Lookup": {
+      "main": [
+        [
+          {
+            "node": "Sandbox HubSpot?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sandbox HubSpot?": {
+      "main": [
+        [
+          {
+            "node": "Simulate HubSpot Lookup (Sandbox)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Search Contact by Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate HubSpot Lookup (Sandbox)": {
+      "main": [
+        [
+          {
+            "node": "Plan HubSpot Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Contact by Email": {
+      "main": [
+        [
+          {
+            "node": "Search Company by Domain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Company by Domain": {
+      "main": [
+        [
+          {
+            "node": "Search Existing Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Existing Ticket": {
+      "main": [
+        [
+          {
+            "node": "Plan HubSpot Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan HubSpot Ticket": {
+      "main": [
+        [
+          {
+            "node": "Has Ticket Write?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Ticket Write?": {
+      "main": [
+        [
+          {
+            "node": "Live Writes?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Live Writes?": {
+      "main": [
+        [
+          {
+            "node": "Write HubSpot Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Simulate Ticket Write (Dry Run)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate Ticket Write (Dry Run)": {
+      "main": [
+        [
+          {
+            "node": "Group Tickets by Account",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write HubSpot Ticket": {
+      "main": [
+        [
+          {
+            "node": "Capture Ticket Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Capture Ticket Result": {
+      "main": [
+        [
+          {
+            "node": "Associate Contact?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Associate Contact?": {
+      "main": [
+        [
+          {
+            "node": "Associate Ticket to Contact",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Associate Company?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Associate Ticket to Contact": {
+      "main": [
+        [
+          {
+            "node": "Associate Company?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Associate Company?": {
+      "main": [
+        [
+          {
+            "node": "Associate Ticket to Company",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Ticket Sync",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Associate Ticket to Company": {
+      "main": [
+        [
+          {
+            "node": "Record Ticket Sync",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Ticket Sync": {
+      "main": [
+        [
+          {
+            "node": "Group Tickets by Account",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Group Tickets by Account": {
+      "main": [
+        [
+          {
+            "node": "Is Company Rollup?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Company Rollup?": {
+      "main": [
+        [
+          {
+            "node": "Sandbox Rollup?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sandbox Rollup?": {
+      "main": [
+        [
+          {
+            "node": "Simulate Company Ticket Search (Sandbox)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Search Company Tickets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate Company Ticket Search (Sandbox)": {
+      "main": [
+        [
+          {
+            "node": "Compute Account Health",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Company Tickets": {
+      "main": [
+        [
+          {
+            "node": "Compute Account Health",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute Account Health": {
+      "main": [
+        [
+          {
+            "node": "Has Health?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Health?": {
+      "main": [
+        [
+          {
+            "node": "Live Health Write?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Live Health Write?": {
+      "main": [
+        [
+          {
+            "node": "Update Company Health",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Simulate Health Write (Dry Run)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate Health Write (Dry Run)": {
+      "main": [
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Company Health": {
+      "main": [
+        [
+          {
+            "node": "Record Health Write",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Health Write": {
+      "main": [
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Sanitized Error Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitized Error Handler": {
+      "main": [
+        [
+          {
+            "node": "Notify Execution Error?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Execution Error?": {
+      "main": [
+        [
+          {
+            "node": "Post Execution Error Notice",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "pinData": {
+    "Zendesk Webhook Trigger": [
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-zendesk-account-id": "100001",
+            "x-zendesk-webhook-id": "01FIXTUREWEBHOOK0000000001",
+            "x-zendesk-webhook-invocation-id": "3293748993",
+            "x-zendesk-webhook-signature": "EH0YkDu3dfwPgXr1jA792ad2fNR4rQpkoO8O1Db7IGg=",
+            "x-zendesk-webhook-signature-timestamp": "2026-11-16T08:55:00Z"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "event": "created",
+            "occurred_at": "2026-11-16T08:40:00Z",
+            "ticket": {
+              "id": 5101,
+              "subject": "Unable to export invoices since this morning",
+              "status": "open",
+              "priority": "high",
+              "channel": "email",
+              "created_at": "2026-11-16T08:40:00Z",
+              "updated_at": "2026-11-16T08:40:00Z",
+              "requester": {
+                "email": "Alex.Rivera@northwind-fixture.example",
+                "name": "Alex Rivera"
+              },
+              "organization": {
+                "name": "Northwind Fixture Traders",
+                "domain": "northwind-fixture.example"
+              },
+              "sentiment": "negative",
+              "tags": [
+                "billing",
+                "export"
+              ]
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/support-ticket-health/zendesk",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT trigger shape · new HubSpot ticket (stage 3, HIGH) · provider sentiment negative · contact + company associations",
+          "sandboxFixtures": {
+            "now": "2026-11-16T09:00:00Z",
+            "zendeskUsers": {
+              "9001": {
+                "email": "priya.nair@harbor-fixture.example",
+                "name": "Priya Nair"
+              }
+            },
+            "contacts": [
+              {
+                "id": "sandbox-contact-101",
+                "properties": {
+                  "email": "alex.rivera@northwind-fixture.example",
+                  "associatedcompanyid": "sandbox-co-1"
+                }
+              },
+              {
+                "id": "sandbox-contact-102",
+                "properties": {
+                  "email": "jordan.lee@contoso-fixture.example",
+                  "associatedcompanyid": "sandbox-co-2"
+                }
+              },
+              {
+                "id": "sandbox-contact-103",
+                "properties": {
+                  "email": "priya.nair@harbor-fixture.example",
+                  "associatedcompanyid": "sandbox-co-3"
+                }
+              }
+            ],
+            "companies": [
+              {
+                "id": "sandbox-co-1",
+                "properties": {
+                  "name": "Northwind Fixture Traders",
+                  "domain": "northwind-fixture.example"
+                }
+              },
+              {
+                "id": "sandbox-co-2",
+                "properties": {
+                  "name": "Contoso Fixture Ltd",
+                  "domain": "contoso-fixture.example"
+                }
+              },
+              {
+                "id": "sandbox-co-3",
+                "properties": {
+                  "name": "Harbor Fixture Logistics",
+                  "domain": "harbor-fixture.example"
+                }
+              }
+            ],
+            "tickets": [
+              {
+                "id": "sandbox-ticket-1",
+                "companyId": "sandbox-co-1",
+                "properties": {
+                  "subject": "Fictional zendesk:5050",
+                  "support_external_id": "zendesk:5050",
+                  "support_source": "zendesk",
+                  "support_status_unified": "resolved",
+                  "support_priority_unified": "normal",
+                  "support_created_at": "2026-11-01T09:00:00Z",
+                  "support_resolved_at": "2026-11-02T10:00:00Z",
+                  "support_resolution_minutes": "1500",
+                  "support_csat_score": null,
+                  "support_sentiment_score": "0",
+                  "support_last_event_at": "2026-11-15T07:00:00Z",
+                  "support_company_id": "sandbox-co-1"
+                }
+              },
+              {
+                "id": "sandbox-ticket-2",
+                "companyId": "sandbox-co-1",
+                "properties": {
+                  "subject": "Fictional zendesk:5060",
+                  "support_external_id": "zendesk:5060",
+                  "support_source": "zendesk",
+                  "support_status_unified": "open",
+                  "support_priority_unified": "high",
+                  "support_created_at": "2026-11-10T09:00:00Z",
+                  "support_resolved_at": null,
+                  "support_resolution_minutes": null,
+                  "support_csat_score": null,
+                  "support_sentiment_score": "-1",
+                  "support_last_event_at": "2026-11-10T09:00:00Z",
+                  "support_company_id": "sandbox-co-1"
+                }
+              },
+              {
+                "id": "sandbox-ticket-3",
+                "companyId": "sandbox-co-1",
+                "properties": {
+                  "subject": "Fictional zendesk:5070",
+                  "support_external_id": "zendesk:5070",
+                  "support_source": "zendesk",
+                  "support_status_unified": "open",
+                  "support_priority_unified": "normal",
+                  "support_created_at": "2026-11-12T09:00:00Z",
+                  "support_resolved_at": null,
+                  "support_resolution_minutes": null,
+                  "support_csat_score": null,
+                  "support_sentiment_score": "0",
+                  "support_last_event_at": "2026-11-12T09:00:00Z",
+                  "support_company_id": "sandbox-co-1"
+                }
+              },
+              {
+                "id": "sandbox-ticket-4",
+                "companyId": "sandbox-co-1",
+                "properties": {
+                  "subject": "Fictional zendesk:5099",
+                  "support_external_id": "zendesk:5099",
+                  "support_source": "zendesk",
+                  "support_status_unified": "waiting_on_customer",
+                  "support_priority_unified": "normal",
+                  "support_created_at": "2026-11-13T09:00:00Z",
+                  "support_resolved_at": null,
+                  "support_resolution_minutes": null,
+                  "support_csat_score": null,
+                  "support_sentiment_score": "-1",
+                  "support_last_event_at": "2026-11-15T12:00:00Z",
+                  "support_company_id": "sandbox-co-1"
+                }
+              },
+              {
+                "id": "sandbox-ticket-5",
+                "companyId": "sandbox-co-1",
+                "properties": {
+                  "subject": "Fictional zendesk:5030",
+                  "support_external_id": "zendesk:5030",
+                  "support_source": "zendesk",
+                  "support_status_unified": "resolved",
+                  "support_priority_unified": "high",
+                  "support_created_at": "2026-10-20T09:00:00Z",
+                  "support_resolved_at": "2026-10-23T03:40:00Z",
+                  "support_resolution_minutes": "4000",
+                  "support_csat_score": "1",
+                  "support_sentiment_score": "-2",
+                  "support_last_event_at": "2026-10-23T03:40:00Z",
+                  "support_company_id": "sandbox-co-1"
+                }
+              },
+              {
+                "id": "sandbox-ticket-6",
+                "companyId": "sandbox-co-2",
+                "properties": {
+                  "subject": "Fictional intercom:8600",
+                  "support_external_id": "intercom:8600",
+                  "support_source": "intercom",
+                  "support_status_unified": "resolved",
+                  "support_priority_unified": "normal",
+                  "support_created_at": "2026-11-05T09:00:00Z",
+                  "support_resolved_at": "2026-11-05T12:20:00Z",
+                  "support_resolution_minutes": "200",
+                  "support_csat_score": "5",
+                  "support_sentiment_score": "2",
+                  "support_last_event_at": "2026-11-05T12:20:00Z",
+                  "support_company_id": "sandbox-co-2"
+                }
+              },
+              {
+                "id": "sandbox-ticket-7",
+                "companyId": "sandbox-co-2",
+                "properties": {
+                  "subject": "Fictional intercom:8650",
+                  "support_external_id": "intercom:8650",
+                  "support_source": "intercom",
+                  "support_status_unified": "resolved",
+                  "support_priority_unified": "normal",
+                  "support_created_at": "2026-11-09T09:00:00Z",
+                  "support_resolved_at": "2026-11-09T10:30:00Z",
+                  "support_resolution_minutes": "90",
+                  "support_csat_score": "4",
+                  "support_sentiment_score": "1",
+                  "support_last_event_at": "2026-11-09T10:30:00Z",
+                  "support_company_id": "sandbox-co-2"
+                }
+              },
+              {
+                "id": "sandbox-ticket-8",
+                "companyId": "sandbox-co-3",
+                "properties": {
+                  "subject": "Fictional zendesk:4990",
+                  "support_external_id": "zendesk:4990",
+                  "support_source": "zendesk",
+                  "support_status_unified": "resolved",
+                  "support_priority_unified": "normal",
+                  "support_created_at": "2026-11-03T09:00:00Z",
+                  "support_resolved_at": "2026-11-03T14:00:00Z",
+                  "support_resolution_minutes": "300",
+                  "support_csat_score": "5",
+                  "support_sentiment_score": "2",
+                  "support_last_event_at": "2026-11-03T14:00:00Z",
+                  "support_company_id": "sandbox-co-3"
+                }
+              }
+            ],
+            "poll": {
+              "zendesk": {
+                "tickets": [
+                  {
+                    "id": 5040,
+                    "subject": "Can we get a copy of last quarter's invoices?",
+                    "status": "solved",
+                    "priority": "low",
+                    "requester_id": 9003,
+                    "organization_id": 7001,
+                    "created_at": "2026-11-10T09:00:00Z",
+                    "updated_at": "2026-11-12T09:00:00Z",
+                    "via": {
+                      "channel": "email"
+                    },
+                    "satisfaction_rating": {
+                      "score": "good"
+                    },
+                    "custom_fields": []
+                  },
+                  {
+                    "id": 5099,
+                    "subject": "Waiting for access logs",
+                    "status": "pending",
+                    "priority": "normal",
+                    "requester_id": 9004,
+                    "organization_id": 7002,
+                    "created_at": "2026-11-13T09:00:00Z",
+                    "updated_at": "2026-11-15T09:00:00Z",
+                    "via": {
+                      "channel": "web"
+                    },
+                    "satisfaction_rating": {
+                      "score": "unoffered"
+                    },
+                    "custom_fields": []
+                  }
+                ],
+                "users": [
+                  {
+                    "id": 9003,
+                    "email": "priya.nair@harbor-fixture.example",
+                    "name": "Priya Nair"
+                  },
+                  {
+                    "id": 9004,
+                    "email": "alex.rivera@northwind-fixture.example",
+                    "name": "Alex Rivera"
+                  }
+                ],
+                "organizations": [
+                  {
+                    "id": 7001,
+                    "name": "Harbor Fixture Logistics",
+                    "domain_names": [
+                      "harbor-fixture.example"
+                    ]
+                  },
+                  {
+                    "id": 7002,
+                    "name": "Northwind Fixture Traders",
+                    "domain_names": [
+                      "northwind-fixture.example"
+                    ]
+                  }
+                ],
+                "after_cursor": "fx-cursor-2",
+                "end_of_stream": true
+              },
+              "intercom": {
+                "type": "conversation.list",
+                "conversations": [
+                  {
+                    "type": "conversation",
+                    "id": "8700",
+                    "created_at": 1794646800,
+                    "updated_at": 1794661200,
+                    "state": "closed",
+                    "open": false,
+                    "priority": "not_priority",
+                    "title": "Thanks, great help with the API keys",
+                    "source": {
+                      "type": "conversation",
+                      "delivered_as": "customer_initiated",
+                      "subject": "",
+                      "body": "<p>fictional message body never stored</p>",
+                      "author": {
+                        "type": "user",
+                        "id": "fx-user-8700",
+                        "name": "Jordan Lee",
+                        "email": "jordan.lee@contoso-fixture.example"
+                      }
+                    },
+                    "contacts": {
+                      "type": "contact.list",
+                      "contacts": [
+                        {
+                          "type": "contact",
+                          "id": "fx-contact-8700"
+                        }
+                      ]
+                    },
+                    "conversation_rating": {
+                      "rating": 4,
+                      "remark": "fictional remark never stored"
+                    },
+                    "statistics": {
+                      "type": "conversation_statistics",
+                      "first_admin_reply_at": 1794648000,
+                      "last_close_at": 1794661200
+                    },
+                    "custom_attributes": {},
+                    "tags": {
+                      "type": "tag.list",
+                      "tags": []
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-zendesk-account-id": "100001",
+            "x-zendesk-webhook-id": "01FIXTUREWEBHOOK0000000001",
+            "x-zendesk-webhook-invocation-id": "2302253082",
+            "x-zendesk-webhook-signature": "Q4Nax6HrJ3NENXXK0aY0LELhVUeNIcalwYreq/LFhnI=",
+            "x-zendesk-webhook-signature-timestamp": "2026-11-16T08:55:00Z"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "account_id": 100001,
+            "id": "01FIXTUREEVT0000000000002",
+            "type": "zen:event-type:ticket.status_changed",
+            "subject": "zen:ticket:5088",
+            "time": "2026-11-16T08:10:00Z",
+            "zendesk_event_version": "2022-11-06",
+            "event": {
+              "previous": "open",
+              "current": "solved"
+            },
+            "detail": {
+              "id": "5088",
+              "subject": "Question about SSO setup",
+              "status": "SOLVED",
+              "priority": "NORMAL",
+              "requester_id": "9001",
+              "organization_id": "7001",
+              "created_at": "2026-11-14T10:00:00Z",
+              "updated_at": "2026-11-16T08:10:00Z"
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/support-ticket-health/zendesk",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT event shape · requester_id → fictional user lookup · resolved after 2770 min · Harbor company"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-zendesk-account-id": "100001",
+            "x-zendesk-webhook-id": "01FIXTUREWEBHOOK0000000001",
+            "x-zendesk-webhook-invocation-id": "2880087067",
+            "x-zendesk-webhook-signature": "SfNlHjSks6FMweTiMvr+OjxHbDySSZnVT6+AnQYRSFk=",
+            "x-zendesk-webhook-signature-timestamp": "2026-11-16T08:55:00Z"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "account_id": 100001,
+            "id": "01FIXTUREEVT0000000000003",
+            "type": "zen:event-type:ticket.csat_received",
+            "subject": "zen:ticket:5050",
+            "time": "2026-11-16T08:30:00Z",
+            "zendesk_event_version": "2022-11-06",
+            "event": {
+              "current": {
+                "score": "bad"
+              }
+            },
+            "detail": {
+              "id": "5050",
+              "status": "solved",
+              "requester_id": "9002",
+              "created_at": "2026-11-01T09:00:00Z",
+              "updated_at": "2026-11-16T08:30:00Z"
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/support-ticket-health/zendesk",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT CSAT bad → csat 1, sentiment −2 on existing HubSpot ticket"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-zendesk-account-id": "100001",
+            "x-zendesk-webhook-id": "01FIXTUREWEBHOOK0000000001",
+            "x-zendesk-webhook-invocation-id": "2781149898",
+            "x-zendesk-webhook-signature": "SLtFWXilE60FHnyZ61i7CRKUk/asmOjFaZs134DnLK0=",
+            "x-zendesk-webhook-signature-timestamp": "2026-11-16T08:55:00Z"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "event": "created",
+            "occurred_at": "2026-11-16T08:45:00Z",
+            "ticket": {
+              "id": 5102,
+              "subject": "PRODUCTION OUTAGE - ALL USERS LOCKED OUT!!",
+              "status": "new",
+              "priority": "urgent",
+              "channel": "web",
+              "created_at": "2026-11-16T08:45:00Z",
+              "updated_at": "2026-11-16T08:45:00Z",
+              "requester": {
+                "email": "alex.rivera@northwind-fixture.example",
+                "name": "Alex Rivera"
+              },
+              "organization": {
+                "name": "Northwind Fixture Traders",
+                "domain": "northwind-fixture.example"
+              }
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/support-ticket-health/zendesk",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT urgent · no provider sentiment → subject lexicon −2 (very_negative)"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-zendesk-account-id": "100001",
+            "x-zendesk-webhook-id": "01FIXTUREWEBHOOK0000000001",
+            "x-zendesk-webhook-invocation-id": "4101290162",
+            "x-zendesk-webhook-signature": "Q06dV2MD3rLBM4h+8FzxbuQXSRVWwvfFWhUIliUAmNM=",
+            "x-zendesk-webhook-signature-timestamp": "2026-11-16T08:55:00Z"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "event": "created",
+            "ticket": {
+              "id": 5199,
+              "subject": "Spoofed",
+              "status": "open"
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/support-ticket-health/zendesk",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT rejected · signature_mismatch"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-zendesk-account-id": "100001",
+            "x-zendesk-webhook-id": "01FIXTUREWEBHOOK0000000001",
+            "x-zendesk-webhook-invocation-id": "3086359427",
+            "x-zendesk-webhook-signature": "EO4gn5BsFTSkix2Bf9AXejdJGZMgJeEquI3H29IbxY4=",
+            "x-zendesk-webhook-signature-timestamp": "2026-11-16T08:55:00Z"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "account_id": 100001,
+            "id": "01FIXTUREEVT0000000000006",
+            "type": "zen:event-type:ticket.tags_changed",
+            "subject": "zen:ticket:5101",
+            "time": "2026-11-16T08:50:00Z",
+            "detail": {
+              "id": "5101"
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/support-ticket-health/zendesk",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT ignored · event_type_not_processed"
+        }
+      }
+    ],
+    "Intercom Webhook Trigger": [
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "user-agent": "intercom-parrot-service-client/1.0",
+            "x-hub-signature": "sha1=f6ac97a5c42c14085295876973bf7b34a04aaa91"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "type": "notification_event",
+            "app_id": "fxapp01",
+            "topic": "conversation.user.created",
+            "id": "notif_8801_created",
+            "created_at": 1794817200,
+            "data": {
+              "type": "notification_event_data",
+              "item": {
+                "type": "conversation",
+                "id": "8801",
+                "created_at": 1794817200,
+                "updated_at": 1794817200,
+                "state": "open",
+                "open": true,
+                "priority": "not_priority",
+                "title": "Quick question: how do I add a teammate?",
+                "source": {
+                  "type": "conversation",
+                  "delivered_as": "customer_initiated",
+                  "subject": "",
+                  "body": "<p>fictional message body never stored</p>",
+                  "author": {
+                    "type": "user",
+                    "id": "fx-user-8801",
+                    "name": "Jordan Lee",
+                    "email": "jordan.lee@contoso-fixture.example"
+                  }
+                },
+                "contacts": {
+                  "type": "contact.list",
+                  "contacts": [
+                    {
+                      "type": "contact",
+                      "id": "fx-contact-8801"
+                    }
+                  ]
+                },
+                "conversation_rating": null,
+                "statistics": {
+                  "type": "conversation_statistics",
+                  "first_admin_reply_at": null,
+                  "last_close_at": null
+                },
+                "custom_attributes": {},
+                "tags": {
+                  "type": "tag.list",
+                  "tags": []
+                }
+              }
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/support-ticket-health/intercom",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT new · lexicon +2 · Contoso",
+          "sandboxFixtures": {
+            "now": "2026-11-16T09:00:00Z",
+            "zendeskUsers": {
+              "9001": {
+                "email": "priya.nair@harbor-fixture.example",
+                "name": "Priya Nair"
+              }
+            },
+            "contacts": [
+              {
+                "id": "sandbox-contact-101",
+                "properties": {
+                  "email": "alex.rivera@northwind-fixture.example",
+                  "associatedcompanyid": "sandbox-co-1"
+                }
+              },
+              {
+                "id": "sandbox-contact-102",
+                "properties": {
+                  "email": "jordan.lee@contoso-fixture.example",
+                  "associatedcompanyid": "sandbox-co-2"
+                }
+              },
+              {
+                "id": "sandbox-contact-103",
+                "properties": {
+                  "email": "priya.nair@harbor-fixture.example",
+                  "associatedcompanyid": "sandbox-co-3"
+                }
+              }
+            ],
+            "companies": [
+              {
+                "id": "sandbox-co-1",
+                "properties": {
+                  "name": "Northwind Fixture Traders",
+                  "domain": "northwind-fixture.example"
+                }
+              },
+              {
+                "id": "sandbox-co-2",
+                "properties": {
+                  "name": "Contoso Fixture Ltd",
+                  "domain": "contoso-fixture.example"
+                }
+              },
+              {
+                "id": "sandbox-co-3",
+                "properties": {
+                  "name": "Harbor Fixture Logistics",
+                  "domain": "harbor-fixture.example"
+                }
+              }
+            ],
+            "tickets": [
+              {
+                "id": "sandbox-ticket-1",
+                "companyId": "sandbox-co-1",
+                "properties": {
+                  "subject": "Fictional zendesk:5050",
+                  "support_external_id": "zendesk:5050",
+                  "support_source": "zendesk",
+                  "support_status_unified": "resolved",
+                  "support_priority_unified": "normal",
+                  "support_created_at": "2026-11-01T09:00:00Z",
+                  "support_resolved_at": "2026-11-02T10:00:00Z",
+                  "support_resolution_minutes": "1500",
+                  "support_csat_score": null,
+                  "support_sentiment_score": "0",
+                  "support_last_event_at": "2026-11-15T07:00:00Z",
+                  "support_company_id": "sandbox-co-1"
+                }
+              },
+              {
+                "id": "sandbox-ticket-2",
+                "companyId": "sandbox-co-1",
+                "properties": {
+                  "subject": "Fictional zendesk:5060",
+                  "support_external_id": "zendesk:5060",
+                  "support_source": "zendesk",
+                  "support_status_unified": "open",
+                  "support_priority_unified": "high",
+                  "support_created_at": "2026-11-10T09:00:00Z",
+                  "support_resolved_at": null,
+                  "support_resolution_minutes": null,
+                  "support_csat_score": null,
+                  "support_sentiment_score": "-1",
+                  "support_last_event_at": "2026-11-10T09:00:00Z",
+                  "support_company_id": "sandbox-co-1"
+                }
+              },
+              {
+                "id": "sandbox-ticket-3",
+                "companyId": "sandbox-co-1",
+                "properties": {
+                  "subject": "Fictional zendesk:5070",
+                  "support_external_id": "zendesk:5070",
+                  "support_source": "zendesk",
+                  "support_status_unified": "open",
+                  "support_priority_unified": "normal",
+                  "support_created_at": "2026-11-12T09:00:00Z",
+                  "support_resolved_at": null,
+                  "support_resolution_minutes": null,
+                  "support_csat_score": null,
+                  "support_sentiment_score": "0",
+                  "support_last_event_at": "2026-11-12T09:00:00Z",
+                  "support_company_id": "sandbox-co-1"
+                }
+              },
+              {
+                "id": "sandbox-ticket-4",
+                "companyId": "sandbox-co-1",
+                "properties": {
+                  "subject": "Fictional zendesk:5099",
+                  "support_external_id": "zendesk:5099",
+                  "support_source": "zendesk",
+                  "support_status_unified": "waiting_on_customer",
+                  "support_priority_unified": "normal",
+                  "support_created_at": "2026-11-13T09:00:00Z",
+                  "support_resolved_at": null,
+                  "support_resolution_minutes": null,
+                  "support_csat_score": null,
+                  "support_sentiment_score": "-1",
+                  "support_last_event_at": "2026-11-15T12:00:00Z",
+                  "support_company_id": "sandbox-co-1"
+                }
+              },
+              {
+                "id": "sandbox-ticket-5",
+                "companyId": "sandbox-co-1",
+                "properties": {
+                  "subject": "Fictional zendesk:5030",
+                  "support_external_id": "zendesk:5030",
+                  "support_source": "zendesk",
+                  "support_status_unified": "resolved",
+                  "support_priority_unified": "high",
+                  "support_created_at": "2026-10-20T09:00:00Z",
+                  "support_resolved_at": "2026-10-23T03:40:00Z",
+                  "support_resolution_minutes": "4000",
+                  "support_csat_score": "1",
+                  "support_sentiment_score": "-2",
+                  "support_last_event_at": "2026-10-23T03:40:00Z",
+                  "support_company_id": "sandbox-co-1"
+                }
+              },
+              {
+                "id": "sandbox-ticket-6",
+                "companyId": "sandbox-co-2",
+                "properties": {
+                  "subject": "Fictional intercom:8600",
+                  "support_external_id": "intercom:8600",
+                  "support_source": "intercom",
+                  "support_status_unified": "resolved",
+                  "support_priority_unified": "normal",
+                  "support_created_at": "2026-11-05T09:00:00Z",
+                  "support_resolved_at": "2026-11-05T12:20:00Z",
+                  "support_resolution_minutes": "200",
+                  "support_csat_score": "5",
+                  "support_sentiment_score": "2",
+                  "support_last_event_at": "2026-11-05T12:20:00Z",
+                  "support_company_id": "sandbox-co-2"
+                }
+              },
+              {
+                "id": "sandbox-ticket-7",
+                "companyId": "sandbox-co-2",
+                "properties": {
+                  "subject": "Fictional intercom:8650",
+                  "support_external_id": "intercom:8650",
+                  "support_source": "intercom",
+                  "support_status_unified": "resolved",
+                  "support_priority_unified": "normal",
+                  "support_created_at": "2026-11-09T09:00:00Z",
+                  "support_resolved_at": "2026-11-09T10:30:00Z",
+                  "support_resolution_minutes": "90",
+                  "support_csat_score": "4",
+                  "support_sentiment_score": "1",
+                  "support_last_event_at": "2026-11-09T10:30:00Z",
+                  "support_company_id": "sandbox-co-2"
+                }
+              },
+              {
+                "id": "sandbox-ticket-8",
+                "companyId": "sandbox-co-3",
+                "properties": {
+                  "subject": "Fictional zendesk:4990",
+                  "support_external_id": "zendesk:4990",
+                  "support_source": "zendesk",
+                  "support_status_unified": "resolved",
+                  "support_priority_unified": "normal",
+                  "support_created_at": "2026-11-03T09:00:00Z",
+                  "support_resolved_at": "2026-11-03T14:00:00Z",
+                  "support_resolution_minutes": "300",
+                  "support_csat_score": "5",
+                  "support_sentiment_score": "2",
+                  "support_last_event_at": "2026-11-03T14:00:00Z",
+                  "support_company_id": "sandbox-co-3"
+                }
+              }
+            ],
+            "poll": {
+              "zendesk": {
+                "tickets": [
+                  {
+                    "id": 5040,
+                    "subject": "Can we get a copy of last quarter's invoices?",
+                    "status": "solved",
+                    "priority": "low",
+                    "requester_id": 9003,
+                    "organization_id": 7001,
+                    "created_at": "2026-11-10T09:00:00Z",
+                    "updated_at": "2026-11-12T09:00:00Z",
+                    "via": {
+                      "channel": "email"
+                    },
+                    "satisfaction_rating": {
+                      "score": "good"
+                    },
+                    "custom_fields": []
+                  },
+                  {
+                    "id": 5099,
+                    "subject": "Waiting for access logs",
+                    "status": "pending",
+                    "priority": "normal",
+                    "requester_id": 9004,
+                    "organization_id": 7002,
+                    "created_at": "2026-11-13T09:00:00Z",
+                    "updated_at": "2026-11-15T09:00:00Z",
+                    "via": {
+                      "channel": "web"
+                    },
+                    "satisfaction_rating": {
+                      "score": "unoffered"
+                    },
+                    "custom_fields": []
+                  }
+                ],
+                "users": [
+                  {
+                    "id": 9003,
+                    "email": "priya.nair@harbor-fixture.example",
+                    "name": "Priya Nair"
+                  },
+                  {
+                    "id": 9004,
+                    "email": "alex.rivera@northwind-fixture.example",
+                    "name": "Alex Rivera"
+                  }
+                ],
+                "organizations": [
+                  {
+                    "id": 7001,
+                    "name": "Harbor Fixture Logistics",
+                    "domain_names": [
+                      "harbor-fixture.example"
+                    ]
+                  },
+                  {
+                    "id": 7002,
+                    "name": "Northwind Fixture Traders",
+                    "domain_names": [
+                      "northwind-fixture.example"
+                    ]
+                  }
+                ],
+                "after_cursor": "fx-cursor-2",
+                "end_of_stream": true
+              },
+              "intercom": {
+                "type": "conversation.list",
+                "conversations": [
+                  {
+                    "type": "conversation",
+                    "id": "8700",
+                    "created_at": 1794646800,
+                    "updated_at": 1794661200,
+                    "state": "closed",
+                    "open": false,
+                    "priority": "not_priority",
+                    "title": "Thanks, great help with the API keys",
+                    "source": {
+                      "type": "conversation",
+                      "delivered_as": "customer_initiated",
+                      "subject": "",
+                      "body": "<p>fictional message body never stored</p>",
+                      "author": {
+                        "type": "user",
+                        "id": "fx-user-8700",
+                        "name": "Jordan Lee",
+                        "email": "jordan.lee@contoso-fixture.example"
+                      }
+                    },
+                    "contacts": {
+                      "type": "contact.list",
+                      "contacts": [
+                        {
+                          "type": "contact",
+                          "id": "fx-contact-8700"
+                        }
+                      ]
+                    },
+                    "conversation_rating": {
+                      "rating": 4,
+                      "remark": "fictional remark never stored"
+                    },
+                    "statistics": {
+                      "type": "conversation_statistics",
+                      "first_admin_reply_at": 1794648000,
+                      "last_close_at": 1794661200
+                    },
+                    "custom_attributes": {},
+                    "tags": {
+                      "type": "tag.list",
+                      "tags": []
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "user-agent": "intercom-parrot-service-client/1.0",
+            "x-hub-signature": "sha1=e3785b2048ea7a0522ee16f757b54096fa9963b8"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "type": "notification_event",
+            "app_id": "fxapp01",
+            "topic": "conversation.admin.closed",
+            "id": "notif_8790_closed",
+            "created_at": 1794816000,
+            "data": {
+              "type": "notification_event_data",
+              "item": {
+                "type": "conversation",
+                "id": "8790",
+                "created_at": 1794805200,
+                "updated_at": 1794816000,
+                "state": "closed",
+                "open": false,
+                "priority": "priority",
+                "title": "Webhook retries failing",
+                "source": {
+                  "type": "conversation",
+                  "delivered_as": "customer_initiated",
+                  "subject": "",
+                  "body": "<p>fictional message body never stored</p>",
+                  "author": {
+                    "type": "user",
+                    "id": "fx-user-8790",
+                    "name": "Jordan Lee",
+                    "email": "jordan.lee@contoso-fixture.example"
+                  }
+                },
+                "contacts": {
+                  "type": "contact.list",
+                  "contacts": [
+                    {
+                      "type": "contact",
+                      "id": "fx-contact-8790"
+                    }
+                  ]
+                },
+                "conversation_rating": null,
+                "statistics": {
+                  "type": "conversation_statistics",
+                  "first_admin_reply_at": 1794805920,
+                  "last_close_at": 1794816000
+                },
+                "custom_attributes": {},
+                "tags": {
+                  "type": "tag.list",
+                  "tags": []
+                }
+              }
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/support-ticket-health/intercom",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT resolved after 180 min · first response 12 min"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "user-agent": "intercom-parrot-service-client/1.0",
+            "x-hub-signature": "sha1=fcb1f6af0ae875c6bed646fdb1d652983e8f920a"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "type": "notification_event",
+            "app_id": "fxapp01",
+            "topic": "conversation.rating.added",
+            "id": "notif_8790_added",
+            "created_at": 1794816300,
+            "data": {
+              "type": "notification_event_data",
+              "item": {
+                "type": "conversation",
+                "id": "8790",
+                "created_at": 1794805200,
+                "updated_at": 1794816300,
+                "state": "closed",
+                "open": false,
+                "priority": "priority",
+                "title": "Webhook retries failing",
+                "source": {
+                  "type": "conversation",
+                  "delivered_as": "customer_initiated",
+                  "subject": "",
+                  "body": "<p>fictional message body never stored</p>",
+                  "author": {
+                    "type": "user",
+                    "id": "fx-user-8790",
+                    "name": "Jordan Lee",
+                    "email": "jordan.lee@contoso-fixture.example"
+                  }
+                },
+                "contacts": {
+                  "type": "contact.list",
+                  "contacts": [
+                    {
+                      "type": "contact",
+                      "id": "fx-contact-8790"
+                    }
+                  ]
+                },
+                "conversation_rating": {
+                  "rating": 5,
+                  "remark": "fictional remark never stored"
+                },
+                "statistics": {
+                  "type": "conversation_statistics",
+                  "first_admin_reply_at": 1794805920,
+                  "last_close_at": 1794816000
+                },
+                "custom_attributes": {},
+                "tags": {
+                  "type": "tag.list",
+                  "tags": []
+                }
+              }
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/support-ticket-health/intercom",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT merged with the close event · CSAT 5 → sentiment +2"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "user-agent": "intercom-parrot-service-client/1.0",
+            "x-hub-signature": "sha1=4129c29739e16560df018293d17af0c345f7d213"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "type": "notification_event",
+            "app_id": "fxapp01",
+            "topic": "ping",
+            "id": "notif_ping",
+            "created_at": 1794816000,
+            "data": {
+              "item": {
+                "type": "ping",
+                "message": "something interesting happened"
+              }
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/support-ticket-health/intercom",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT ignored · ping"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "user-agent": "intercom-parrot-service-client/1.0",
+            "x-hub-signature": "sha1=b863f93859984dfd9bc1e223999e48cf1b6a7886"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "type": "notification_event",
+            "app_id": "fxapp01",
+            "topic": "conversation.user.created",
+            "id": "notif_8805_created",
+            "created_at": 1794817800,
+            "data": {
+              "type": "notification_event_data",
+              "item": {
+                "type": "conversation",
+                "id": "8805",
+                "created_at": 1794817800,
+                "updated_at": 1794817800,
+                "state": "open",
+                "open": true,
+                "priority": "not_priority",
+                "title": "Billing question",
+                "source": {
+                  "type": "conversation",
+                  "delivered_as": "customer_initiated",
+                  "subject": "",
+                  "body": "<p>fictional message body never stored</p>",
+                  "author": {
+                    "type": "user",
+                    "id": "fx-user-8805",
+                    "name": "Sam",
+                    "email": "sam.fixture@gmail.com"
+                  }
+                },
+                "contacts": {
+                  "type": "contact.list",
+                  "contacts": [
+                    {
+                      "type": "contact",
+                      "id": "fx-contact-8805"
+                    }
+                  ]
+                },
+                "conversation_rating": null,
+                "statistics": {
+                  "type": "conversation_statistics",
+                  "first_admin_reply_at": null,
+                  "last_close_at": null
+                },
+                "custom_attributes": {},
+                "tags": {
+                  "type": "tag.list",
+                  "tags": []
+                }
+              }
+            }
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/support-ticket-health/intercom",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT free-mailbox requester · no contact/company · ticket created unassociated"
+        }
+      }
+    ],
+    "Reconcile Poll": [
+      {
+        "json": {
+          "timestamp": "2026-11-16T09:00:00.000+00:00",
+          "Readable date": "November 16th 2026, 9:00:00 am",
+          "Timezone": "UTC",
+          "sandboxFixtures": {
+            "now": "2026-11-16T09:00:00Z",
+            "zendeskUsers": {
+              "9001": {
+                "email": "priya.nair@harbor-fixture.example",
+                "name": "Priya Nair"
+              }
+            },
+            "contacts": [
+              {
+                "id": "sandbox-contact-101",
+                "properties": {
+                  "email": "alex.rivera@northwind-fixture.example",
+                  "associatedcompanyid": "sandbox-co-1"
+                }
+              },
+              {
+                "id": "sandbox-contact-102",
+                "properties": {
+                  "email": "jordan.lee@contoso-fixture.example",
+                  "associatedcompanyid": "sandbox-co-2"
+                }
+              },
+              {
+                "id": "sandbox-contact-103",
+                "properties": {
+                  "email": "priya.nair@harbor-fixture.example",
+                  "associatedcompanyid": "sandbox-co-3"
+                }
+              }
+            ],
+            "companies": [
+              {
+                "id": "sandbox-co-1",
+                "properties": {
+                  "name": "Northwind Fixture Traders",
+                  "domain": "northwind-fixture.example"
+                }
+              },
+              {
+                "id": "sandbox-co-2",
+                "properties": {
+                  "name": "Contoso Fixture Ltd",
+                  "domain": "contoso-fixture.example"
+                }
+              },
+              {
+                "id": "sandbox-co-3",
+                "properties": {
+                  "name": "Harbor Fixture Logistics",
+                  "domain": "harbor-fixture.example"
+                }
+              }
+            ],
+            "tickets": [
+              {
+                "id": "sandbox-ticket-1",
+                "companyId": "sandbox-co-1",
+                "properties": {
+                  "subject": "Fictional zendesk:5050",
+                  "support_external_id": "zendesk:5050",
+                  "support_source": "zendesk",
+                  "support_status_unified": "resolved",
+                  "support_priority_unified": "normal",
+                  "support_created_at": "2026-11-01T09:00:00Z",
+                  "support_resolved_at": "2026-11-02T10:00:00Z",
+                  "support_resolution_minutes": "1500",
+                  "support_csat_score": null,
+                  "support_sentiment_score": "0",
+                  "support_last_event_at": "2026-11-15T07:00:00Z",
+                  "support_company_id": "sandbox-co-1"
+                }
+              },
+              {
+                "id": "sandbox-ticket-2",
+                "companyId": "sandbox-co-1",
+                "properties": {
+                  "subject": "Fictional zendesk:5060",
+                  "support_external_id": "zendesk:5060",
+                  "support_source": "zendesk",
+                  "support_status_unified": "open",
+                  "support_priority_unified": "high",
+                  "support_created_at": "2026-11-10T09:00:00Z",
+                  "support_resolved_at": null,
+                  "support_resolution_minutes": null,
+                  "support_csat_score": null,
+                  "support_sentiment_score": "-1",
+                  "support_last_event_at": "2026-11-10T09:00:00Z",
+                  "support_company_id": "sandbox-co-1"
+                }
+              },
+              {
+                "id": "sandbox-ticket-3",
+                "companyId": "sandbox-co-1",
+                "properties": {
+                  "subject": "Fictional zendesk:5070",
+                  "support_external_id": "zendesk:5070",
+                  "support_source": "zendesk",
+                  "support_status_unified": "open",
+                  "support_priority_unified": "normal",
+                  "support_created_at": "2026-11-12T09:00:00Z",
+                  "support_resolved_at": null,
+                  "support_resolution_minutes": null,
+                  "support_csat_score": null,
+                  "support_sentiment_score": "0",
+                  "support_last_event_at": "2026-11-12T09:00:00Z",
+                  "support_company_id": "sandbox-co-1"
+                }
+              },
+              {
+                "id": "sandbox-ticket-4",
+                "companyId": "sandbox-co-1",
+                "properties": {
+                  "subject": "Fictional zendesk:5099",
+                  "support_external_id": "zendesk:5099",
+                  "support_source": "zendesk",
+                  "support_status_unified": "waiting_on_customer",
+                  "support_priority_unified": "normal",
+                  "support_created_at": "2026-11-13T09:00:00Z",
+                  "support_resolved_at": null,
+                  "support_resolution_minutes": null,
+                  "support_csat_score": null,
+                  "support_sentiment_score": "-1",
+                  "support_last_event_at": "2026-11-15T12:00:00Z",
+                  "support_company_id": "sandbox-co-1"
+                }
+              },
+              {
+                "id": "sandbox-ticket-5",
+                "companyId": "sandbox-co-1",
+                "properties": {
+                  "subject": "Fictional zendesk:5030",
+                  "support_external_id": "zendesk:5030",
+                  "support_source": "zendesk",
+                  "support_status_unified": "resolved",
+                  "support_priority_unified": "high",
+                  "support_created_at": "2026-10-20T09:00:00Z",
+                  "support_resolved_at": "2026-10-23T03:40:00Z",
+                  "support_resolution_minutes": "4000",
+                  "support_csat_score": "1",
+                  "support_sentiment_score": "-2",
+                  "support_last_event_at": "2026-10-23T03:40:00Z",
+                  "support_company_id": "sandbox-co-1"
+                }
+              },
+              {
+                "id": "sandbox-ticket-6",
+                "companyId": "sandbox-co-2",
+                "properties": {
+                  "subject": "Fictional intercom:8600",
+                  "support_external_id": "intercom:8600",
+                  "support_source": "intercom",
+                  "support_status_unified": "resolved",
+                  "support_priority_unified": "normal",
+                  "support_created_at": "2026-11-05T09:00:00Z",
+                  "support_resolved_at": "2026-11-05T12:20:00Z",
+                  "support_resolution_minutes": "200",
+                  "support_csat_score": "5",
+                  "support_sentiment_score": "2",
+                  "support_last_event_at": "2026-11-05T12:20:00Z",
+                  "support_company_id": "sandbox-co-2"
+                }
+              },
+              {
+                "id": "sandbox-ticket-7",
+                "companyId": "sandbox-co-2",
+                "properties": {
+                  "subject": "Fictional intercom:8650",
+                  "support_external_id": "intercom:8650",
+                  "support_source": "intercom",
+                  "support_status_unified": "resolved",
+                  "support_priority_unified": "normal",
+                  "support_created_at": "2026-11-09T09:00:00Z",
+                  "support_resolved_at": "2026-11-09T10:30:00Z",
+                  "support_resolution_minutes": "90",
+                  "support_csat_score": "4",
+                  "support_sentiment_score": "1",
+                  "support_last_event_at": "2026-11-09T10:30:00Z",
+                  "support_company_id": "sandbox-co-2"
+                }
+              },
+              {
+                "id": "sandbox-ticket-8",
+                "companyId": "sandbox-co-3",
+                "properties": {
+                  "subject": "Fictional zendesk:4990",
+                  "support_external_id": "zendesk:4990",
+                  "support_source": "zendesk",
+                  "support_status_unified": "resolved",
+                  "support_priority_unified": "normal",
+                  "support_created_at": "2026-11-03T09:00:00Z",
+                  "support_resolved_at": "2026-11-03T14:00:00Z",
+                  "support_resolution_minutes": "300",
+                  "support_csat_score": "5",
+                  "support_sentiment_score": "2",
+                  "support_last_event_at": "2026-11-03T14:00:00Z",
+                  "support_company_id": "sandbox-co-3"
+                }
+              }
+            ],
+            "poll": {
+              "zendesk": {
+                "tickets": [
+                  {
+                    "id": 5040,
+                    "subject": "Can we get a copy of last quarter's invoices?",
+                    "status": "solved",
+                    "priority": "low",
+                    "requester_id": 9003,
+                    "organization_id": 7001,
+                    "created_at": "2026-11-10T09:00:00Z",
+                    "updated_at": "2026-11-12T09:00:00Z",
+                    "via": {
+                      "channel": "email"
+                    },
+                    "satisfaction_rating": {
+                      "score": "good"
+                    },
+                    "custom_fields": []
+                  },
+                  {
+                    "id": 5099,
+                    "subject": "Waiting for access logs",
+                    "status": "pending",
+                    "priority": "normal",
+                    "requester_id": 9004,
+                    "organization_id": 7002,
+                    "created_at": "2026-11-13T09:00:00Z",
+                    "updated_at": "2026-11-15T09:00:00Z",
+                    "via": {
+                      "channel": "web"
+                    },
+                    "satisfaction_rating": {
+                      "score": "unoffered"
+                    },
+                    "custom_fields": []
+                  }
+                ],
+                "users": [
+                  {
+                    "id": 9003,
+                    "email": "priya.nair@harbor-fixture.example",
+                    "name": "Priya Nair"
+                  },
+                  {
+                    "id": 9004,
+                    "email": "alex.rivera@northwind-fixture.example",
+                    "name": "Alex Rivera"
+                  }
+                ],
+                "organizations": [
+                  {
+                    "id": 7001,
+                    "name": "Harbor Fixture Logistics",
+                    "domain_names": [
+                      "harbor-fixture.example"
+                    ]
+                  },
+                  {
+                    "id": 7002,
+                    "name": "Northwind Fixture Traders",
+                    "domain_names": [
+                      "northwind-fixture.example"
+                    ]
+                  }
+                ],
+                "after_cursor": "fx-cursor-2",
+                "end_of_stream": true
+              },
+              "intercom": {
+                "type": "conversation.list",
+                "conversations": [
+                  {
+                    "type": "conversation",
+                    "id": "8700",
+                    "created_at": 1794646800,
+                    "updated_at": 1794661200,
+                    "state": "closed",
+                    "open": false,
+                    "priority": "not_priority",
+                    "title": "Thanks, great help with the API keys",
+                    "source": {
+                      "type": "conversation",
+                      "delivered_as": "customer_initiated",
+                      "subject": "",
+                      "body": "<p>fictional message body never stored</p>",
+                      "author": {
+                        "type": "user",
+                        "id": "fx-user-8700",
+                        "name": "Jordan Lee",
+                        "email": "jordan.lee@contoso-fixture.example"
+                      }
+                    },
+                    "contacts": {
+                      "type": "contact.list",
+                      "contacts": [
+                        {
+                          "type": "contact",
+                          "id": "fx-contact-8700"
+                        }
+                      ]
+                    },
+                    "conversation_rating": {
+                      "rating": 4,
+                      "remark": "fictional remark never stored"
+                    },
+                    "statistics": {
+                      "type": "conversation_statistics",
+                      "first_admin_reply_at": 1794648000,
+                      "last_close_at": 1794661200
+                    },
+                    "custom_attributes": {},
+                    "tags": {
+                      "type": "tag.list",
+                      "tags": []
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    ]
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": false,
+    "callerPolicy": "workflowsFromSameOwner",
+    "timezone": "UTC"
+  },
+  "tags": [],
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "author": "DH Robin (dhRobin Systems)",
+    "license": "MIT"
+  }
+}
