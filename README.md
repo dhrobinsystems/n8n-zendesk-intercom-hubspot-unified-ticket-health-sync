@@ -45,6 +45,8 @@ My answer: sync **ticket metadata, not conversations**, key every record on a st
 
 ## 2. Architecture
 
+![n8n Zendesk & Intercom to HubSpot Unified Ticket Health Sync Workflow](./workflow-overview.png)
+
 ```mermaid
 flowchart TD
     ZW[Zendesk Webhook Trigger] --> V[Verify & Unwrap Support Event<br/>Zendesk HMAC-SHA256 · Intercom HMAC-SHA1]
